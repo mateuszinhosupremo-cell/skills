@@ -26,7 +26,7 @@ local VirtualUser  = game:GetService("VirtualUser")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "1.4"
+local VERSION = "1.6"
 
 local Config = {
   FarmPumpkins   = false,
@@ -37,9 +37,19 @@ local Config = {
   NotifyPumpkins = false,
   AutoMinimize   = true,
   AutoMode       = true,   -- testa outro modo de soco se o atual não registrar
-  AllowMouse     = false,  -- mouse VIM faz o Roblox virar layout de PC no celular   -- minimiza o hub ao ligar o farm (o clique não acerta o menu)
+  AllowMouse     = false,
+  AutoDoors      = false,  -- bate nas portas durante a Harvest Moon
+  AutoBosses     = true,   -- mata Unbound Werewolf e Hellfire Gas quando aparecem
+  BossKeys       = {"werewolf", "hellfire", "hellrider", "unbound"},
+  BossRadius     = 3000,
+  BossTimeout    = 600,    -- os dois somem depois de ~10 min
+  BossHeight     = 8,      -- altura acima da cabeça do boss
+  BossSafePct    = 35,     -- com vida abaixo disso (%), sobe pra recuperar
+  DoorWait       = 2.5,    -- s parado na porta esperando a resposta
+  DoorNames      = {"halloweendoor"},
+  DoorTextKeys   = {"trick", "treat", "knock", "doce", "porta"},  -- mouse VIM faz o Roblox virar layout de PC no celular   -- minimiza o hub ao ligar o farm (o clique não acerta o menu)
 
-  TweenSpeed   = 300,
+  TweenSpeed   = 250,   -- acima disso o server te puxa de volta
   HitDistance  = 3.5,
   StandHeight  = 1.5,
   JackHeight   = 8,
@@ -64,12 +74,12 @@ local MODE_LABEL = {
 }
 local State = {
   running = true, active = false, lock = nil, gui = nil,
-  pumpkins = {}, done = setmetatable({}, {__mode = "k"}), jackQueue = {},
+  pumpkins = {}, done = setmetatable({}, {__mode = "k"}), jackQueue = {}, bossQueue = {},
   modeIndex = 3, modeConfirmed = true, switches = 0, modeRefresh = nil, -- 3 = Remote
   status = "carregando", lastOpenPos = nil, lastOpenTime = 0,
   jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0, avoid = {},
 }
-local Stats = {opened = 0, jacks = 0, start = os.clock()}
+local Stats = {opened = 0, jacks = 0, bosses = 0, start = os.clock()}
 
 local notify = function() end -- a UI troca isso pelos avisos de verdade
 
@@ -378,6 +388,14 @@ end
 ------------------------------------------------------------------
 -- JACK
 ------------------------------------------------------------------
+local function isBossName(n)
+  n = string.lower(n):gsub("[%s_%-']", "")
+  for _, k in ipairs(Config.BossKeys) do
+    if n:find(k, 1, true) then return true end
+  end
+  return false
+end
+
 local function nameIsJack(n)
   n = string.lower(n)
   for _, k in ipairs(Config.JackKeys) do
@@ -393,6 +411,12 @@ local function watchJack(m)
     local hum = m:FindFirstChildOfClass("Humanoid")
     local p = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
     if not (hum and p and hum.Health > 0) then return end
+    if isBossName(m.Name) then
+      table.insert(State.bossQueue, m)
+      log("boss apareceu: " .. m.Name)
+      notify("BOSS: " .. m.Name .. "!", Config.AutoBosses and "Indo matar" or "Liga 'Matar bosses' pra ir", "warn", 5)
+      return
+    end
     local nearOpen = State.lastOpenPos and os.clock() - State.lastOpenTime < 8
       and (p.Position - State.lastOpenPos).Magnitude < 80
     if nameIsJack(m.Name) or nearOpen then
@@ -421,6 +445,32 @@ local function hookWatchers()
   if h then attachHunt(h) end
 end
 
+local function findBoss()
+  local root = getRoot()
+  if not root then return nil end
+  local best, bd = nil, Config.BossRadius
+  local function consider(m)
+    local hum = m:FindFirstChildOfClass("Humanoid")
+    local p = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+    if m.Parent and hum and hum.Health > 0 and p and not Players:GetPlayerFromCharacter(m) then
+      local d = (p.Position - root.Position).Magnitude
+      if d < bd then best, bd = m, d end
+    end
+  end
+  for i = #State.bossQueue, 1, -1 do
+    local m = State.bossQueue[i]
+    local hum = m.Parent and m:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then table.remove(State.bossQueue, i) else consider(m) end
+  end
+  local enemies = workspace:FindFirstChild("Enemies")
+  if enemies then
+    for _, m in ipairs(enemies:GetChildren()) do
+      if isBossName(m.Name) then consider(m) end
+    end
+  end
+  return best
+end
+
 local function findJack()
   local root = getRoot()
   if not root then return nil end
@@ -447,24 +497,52 @@ local function findJack()
   return best
 end
 
-local function killJack(m)
+local function killJack(m, kind)
   local hum = m:FindFirstChildOfClass("Humanoid")
   local hrp = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
   if not (hum and hrp) then return end
   local useClick = not Config.JackRemote
+  local boss = kind == "boss"
+  local top = 0
+  if boss then
+    local ok, size = pcall(function() return m:GetExtentsSize() end)
+    top = ok and math.min(size.Y * 0.5, 20) or 6
+  end
   local function above()
-    local h = useClick and Config.JackClickH or Config.JackHeight
+    local h = useClick and Config.JackClickH or (boss and (top + Config.BossHeight) or Config.JackHeight)
     local pos = hrp.Position + Vector3.new(0, h, 1.5)
     return CFrame.lookAt(pos, hrp.Position)
   end
   log("focando no " .. m.Name)
-  notify("Jack O'Lantern!", "Clique pausado, focando só nele", "warn")
+  if boss then
+    notify("Boss: " .. m.Name, "Killaura nele até morrer, foco total", "warn", 4)
+  elseif kind == "mob" then
+    notify("Trick!", "Matando " .. m.Name, "warn", 2)
+  else
+    notify("Jack O'Lantern!", "Clique pausado, focando só nele", "warn")
+  end
   if not tweenTo(above()) then return end
   State.lock = above
   local t0, lastHp, lastDrop = os.clock(), hum.Health, os.clock()
-  while State.running and State.active and Config.KillJack and alive() and m.Parent and hum.Health > 0 do
+  local allowed = function()
+    if boss then return Config.AutoBosses end
+    return Config.KillJack or kind == "mob"
+  end
+  while State.running and State.active and allowed() and alive() and m.Parent and hum.Health > 0 do
     State.jackMode = useClick and "clique" or ("remoto " .. Hit.mode)
-    if os.clock() - t0 > 60 then log("Jack demorou demais") break end
+    if os.clock() - t0 > (boss and Config.BossTimeout or 60) then log(m.Name .. " demorou demais") break end
+    local me = getHum()
+    if boss and me and me.Health < me.MaxHealth * Config.BossSafePct / 100 then
+      notify("Vida baixa!", "Subindo pra recuperar", "warn", 3)
+      local safe = CFrame.new(hrp.Position + Vector3.new(0, 120, 0))
+      tweenTo(safe)
+      State.lock = safe
+      local t1 = os.clock()
+      while State.running and alive() and me.Health < me.MaxHealth * 0.75 and os.clock() - t1 < 25 do task.wait(0.5) end
+      if not alive() then break end
+      tweenTo(above())
+      State.lock = above
+    end
     if useClick then
       pcall(click, m, m:FindFirstChild("Head") or hrp)
       humanPause(0.7)
@@ -502,7 +580,11 @@ local function killJack(m)
   end
   State.lock = nil
   State.jackMode = nil
-  if hum.Health <= 0 then
+  if hum.Health <= 0 and boss then
+    Stats.bosses = Stats.bosses + 1
+    log(m.Name .. " derrotado")
+    notify("Boss derrotado! 🏆", m.Name .. " caiu", "ok", 6)
+  elseif hum.Health <= 0 and kind ~= "mob" then
     Stats.jacks = Stats.jacks + 1
     log("Jack derrotado")
     notify("Jack derrotado", "Voltando pras abóboras", "ok")
@@ -528,7 +610,7 @@ local function farmPumpkin(t)
   local prev, noHit = base, 0
   for _ = 1, Config.MaxClicks do
     if not (State.running and State.active and Config.FarmPumpkins and alive()) then break end
-    if Config.KillJack and findJack() then State.lock = nil return end
+    if (Config.KillJack and findJack()) or (Config.AutoBosses and findBoss()) then State.lock = nil return end
     pcall(click, t.key:IsA("Model") and t.key or t.key.Parent, t.parts[1])
     humanPause()
     local opened, hit, now = compare(t, base, prev)
@@ -561,12 +643,19 @@ end
 ------------------------------------------------------------------
 -- LOOPS
 ------------------------------------------------------------------
+local doorStep -- definido no módulo de portas, mais abaixo
+
 local function step()
   if not alive() then State.active = false State.lock = nil return end
+  if Config.AutoBosses then
+    local b = findBoss()
+    if b then State.active = true killJack(b, "boss") return end
+  end
   if Config.KillJack then
     local j = findJack()
     if j then State.active = true killJack(j) return end
   end
+  if doorStep and doorStep() then return end
   if Config.FarmPumpkins then
     local t = nearestPumpkin()
     if t then State.active = true farmPumpkin(t) return end
@@ -855,6 +944,206 @@ local function startEventLoop()
         task.spawn(readEvent)
       end
       task.wait(0.5)
+    end
+  end)
+end
+
+------------------------------------------------------------------
+-- PORTAS (Harvest Moon)
+------------------------------------------------------------------
+local Doors = {list = {}, visited = setmetatable({}, {__mode = "k"}), hour = -1, done = 0, scanning = false, lastScan = 0}
+
+local function isDoorName(n)
+  n = string.lower(n):gsub("[%s_%-]", "")
+  for _, k in ipairs(Config.DoorNames) do
+    if n:find(k, 1, true) then return true end
+  end
+  return false
+end
+
+local function doorInteract(model)
+  local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
+  if prompt then return "prompt", prompt end
+  local cd = model:FindFirstChildWhichIsA("ClickDetector", true)
+  if cd then return "click", cd end
+  local touch = model:FindFirstChildWhichIsA("TouchTransmitter", true)
+  if touch then return "touch", touch.Parent end
+  return nil, nil
+end
+
+local function scanDoors()
+  if Doors.scanning then return end
+  Doors.scanning = true
+  local out, seen = {}, {}
+  local map = workspace:FindFirstChild("Map") or workspace
+  for i, d in ipairs(map:GetDescendants()) do
+    if i % 4000 == 0 then task.wait() end
+    if d:IsA("Model") and isDoorName(d.Name) and not seen[d] then
+      seen[d] = true
+      out[#out + 1] = d
+    elseif d:IsA("ProximityPrompt") then
+      local txt = string.lower(d.ActionText .. " " .. d.ObjectText)
+      for _, k in ipairs(Config.DoorTextKeys) do
+        if txt:find(k, 1, true) then
+          local m = d:FindFirstAncestor("HalloweenDoor") or d:FindFirstAncestorWhichIsA("Model")
+          if m and not seen[m] then seen[m] = true out[#out + 1] = m end
+          break
+        end
+      end
+    end
+  end
+  Doors.list = out
+  Doors.lastScan = os.clock()
+  Doors.scanning = false
+end
+
+local function doorPos(model)
+  local kind, h = doorInteract(model)
+  local part = h
+  if kind == "prompt" or kind == "click" then part = h.Parent end
+  if part and part:IsA("Attachment") then return kind, h, part.WorldPosition end
+  if part and part:IsA("BasePart") then return kind, h, part.Position end
+  return kind, h, model:GetPivot().Position
+end
+
+local function nearestDoor()
+  local root = getRoot()
+  if not root then return nil end
+  local best, bd = nil, math.huge
+  for _, m in ipairs(Doors.list) do
+    if m.Parent and not Doors.visited[m] then
+      local d = (m:GetPivot().Position - root.Position).Magnitude
+      if d < bd then best, bd = m, d end
+    end
+  end
+  return best
+end
+
+local function doDoor(model)
+  Doors.visited[model] = true
+  local kind, h, pos = doorPos(model)
+  local look = model:GetPivot().LookVector
+  local flat = Vector3.new(look.X, 0, look.Z)
+  flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(1, 0, 0)
+  local stand = pos + flat * 3.5
+  local cf = CFrame.lookAt(stand, Vector3.new(pos.X, stand.Y, pos.Z))
+  log("indo até a porta")
+  if not tweenTo(cf) then return end
+  State.lock = cf
+  task.wait(0.3)
+  local before = Event.gain.candy
+  if kind == "prompt" then
+    if fireproximityprompt then
+      pcall(fireproximityprompt, h)
+    else
+      pcall(function() h:InputHoldBegin() task.wait(h.HoldDuration + 0.1) h:InputHoldEnd() end)
+    end
+  elseif kind == "click" then
+    if fireclickdetector then pcall(fireclickdetector, h) end
+  elseif kind == "touch" then
+    local root = getRoot()
+    if firetouchinterest and root then
+      pcall(firetouchinterest, root, h, 0)
+      task.wait()
+      pcall(firetouchinterest, root, h, 1)
+    end
+  else
+    for _ = 1, 4 do
+      pcall(click, model, model:FindFirstChildWhichIsA("BasePart", true))
+      humanPause()
+    end
+  end
+  -- fica parado esperando a resposta (sair de perto cancela a porta)
+  local t0 = os.clock()
+  while os.clock() - t0 < Config.DoorWait and State.running do
+    pcall(pollNotifications)
+    task.wait(0.2)
+  end
+  Doors.done = Doors.done + 1
+  local gained = Event.gain.candy - before
+  if gained > 0 then notify("Porta: doce!", "+" .. gained .. " Candy Corn", "ok", 2) end
+  -- trick: mata o que nasceu perto da porta
+  local enemies = workspace:FindFirstChild("Enemies")
+  if enemies then
+    for _, m in ipairs(enemies:GetChildren()) do
+      local hrp = m:FindFirstChild("HumanoidRootPart")
+      local hum = m:FindFirstChildOfClass("Humanoid")
+      if hrp and hum and hum.Health > 0 and (hrp.Position - pos).Magnitude < 70 then
+        killJack(m, isBossName(m.Name) and "boss" or "mob")
+      end
+    end
+  end
+  State.lock = nil
+end
+
+doorStep = function()
+  if not Config.AutoDoors then return false end
+  local hour = math.floor(os.time() / 3600)
+  if hour ~= Doors.hour then
+    Doors.hour, Doors.done = hour, 0
+    Doors.visited = setmetatable({}, {__mode = "k"})
+  end
+  local active = moonInfo()
+  if not active then return false end
+  local d = nearestDoor()
+  if not d then return false end
+  State.active = true
+  doDoor(d)
+  return true
+end
+
+local function doorDiag()
+  if #Doors.list == 0 then scanDoors() end
+  local out = {}
+  local function add(s) out[#out + 1] = tostring(s) end
+  local active, left = moonInfo()
+  add("v" .. VERSION .. " | lua " .. (active and "ATIVA" or "fora") .. " | portas achadas: " .. #Doors.list)
+  local root = getRoot()
+  local best, bd = nil, math.huge
+  if root then
+    for _, m in ipairs(Doors.list) do
+      local d = (m:GetPivot().Position - root.Position).Magnitude
+      if d < bd then best, bd = m, d end
+    end
+  end
+  if best then
+    local base = best:GetFullName()
+    add("mais perto: " .. base .. " (" .. math.floor(bd) .. " studs)")
+    local ok, attrs = pcall(function() return best:GetAttributes() end)
+    if ok then for k, v in pairs(attrs) do add("  @" .. k .. " = " .. tostring(v)) end end
+    local n = 0
+    for _, d in ipairs(best:GetDescendants()) do
+      n = n + 1
+      if n > 40 then add("  ...") break end
+      local extra = ""
+      if d:IsA("ProximityPrompt") then
+        extra = " action='" .. d.ActionText .. "' object='" .. d.ObjectText .. "' hold=" .. d.HoldDuration
+          .. " dist=" .. d.MaxActivationDistance .. " on=" .. tostring(d.Enabled)
+      elseif d:IsA("ClickDetector") then
+        extra = " dist=" .. d.MaxActivationDistance
+      end
+      add("  " .. d.ClassName .. " " .. string.sub(d:GetFullName(), #base + 2) .. extra)
+    end
+  end
+  for i = 1, math.min(8, #Doors.list) do add("porta " .. i .. ": " .. Doors.list[i]:GetFullName()) end
+  local text = table.concat(out, "\n")
+  print("[Claude Hub] diagnostico de portas:\n" .. text)
+  return setclipboard and pcall(setclipboard, text)
+end
+
+local function startDoorLoop()
+  task.spawn(function()
+    local wasActive = false
+    while State.running do
+      local active = moonInfo()
+      if (active and not wasActive) or os.clock() - Doors.lastScan > 60 or #Doors.list == 0 then
+        pcall(scanDoors)
+        if active and not wasActive and Config.AutoDoors then
+          notify("Farm de portas", #Doors.list .. " portas pra bater nesta lua", "ok", 4)
+        end
+      end
+      wasActive = active
+      task.wait(5)
     end
   end)
 end
@@ -1303,6 +1592,8 @@ local function buildWindow(gui)
   toggle(farm, "Matar Jack", "Pausa o clique e foca só nele", "KillJack")
   toggle(farm, "Killaura remoto", "RegisterHit, sem clique", "JackRemote")
   toggle(farm, "Clique se o remote falhar", "Desce e soca se não der dano", "JackFallback")
+  section(farm, "BOSSES DO EVENTO")
+  toggle(farm, "Matar bosses", "Unbound Werewolf e Hellfire Gas", "AutoBosses")
   section(farm, "OUTROS")
   toggle(farm, "Anti-AFK", nil, "AntiAFK")
 
@@ -1314,6 +1605,16 @@ local function buildWindow(gui)
     nextAt  = statRow(ev, "Próxima às"),
     ends    = statRow(ev, "Evento acaba em"),
   }
+  section(ev, "PORTAS (HARVEST MOON)")
+  toggle(ev, "Farm de portas", "1x por porta a cada lua, mata o trick", "AutoDoors")
+  er.doors = statRow(ev, "Portas achadas")
+  er.doorsDone = statRow(ev, "Batidas nesta lua")
+  button(ev, "🚪  Diagnóstico de portas", function()
+    task.spawn(function()
+      if doorDiag() then notify("Diagnóstico copiado", "Cola aqui no chat pro Claude", "ok", 5)
+      else notify("Diagnóstico no console", "Abre o console e me manda", "info", 5) end
+    end)
+  end)
   section(ev, "DOCES")
   er.candy  = statRow(ev, "Candy Corn")
   er.gain   = statRow(ev, "Ganho na sessão")
@@ -1387,6 +1688,9 @@ local function buildWindow(gui)
   slider(cfg, "Altura no remoto", "JackHeight", 3, 15, 1, " st")
   slider(cfg, "Altura no clique", "JackClickH", 1, 6, 0.5, " st")
   slider(cfg, "Intervalo do killaura", "JackHitDelay", 0.05, 0.4, 0.01, "s")
+  section(cfg, "BOSS")
+  slider(cfg, "Altura acima do boss", "BossHeight", 3, 25, 1, " st")
+  slider(cfg, "Fugir com vida abaixo de", "BossSafePct", 10, 60, 5, "%")
   section(cfg, "CLIQUE HUMANO")
   slider(cfg, "Intervalo mínimo", "ClickMin", 0.08, 0.3, 0.01, "s")
   slider(cfg, "Intervalo máximo", "ClickMax", 0.12, 0.5, 0.01, "s")
@@ -1399,6 +1703,7 @@ local function buildWindow(gui)
     status = statRow(st, "Agora"),
     opened = statRow(st, "Abóboras abertas"),
     jacks  = statRow(st, "Jacks derrotados"),
+    bosses = statRow(st, "Bosses derrotados"),
     free   = statRow(st, "Abóboras livres"),
     click  = statRow(st, "Clique"),
     aura   = statRow(st, "Killaura"),
@@ -1413,7 +1718,8 @@ local function buildWindow(gui)
     .. "• O evento acaba 15/11 às 01:00 UTC (22:00 de 14/11 em Brasília).\n"
     .. "• Soco não registra ou a tela vira PC? Ajustes → Modo de soco.\n"
     .. "• Killaura sem dano? Me manda o console.\n"
-    .. "• Doces errados? Evento → Diagnóstico de doces e me manda.")
+    .. "• Doces errados? Evento → Diagnóstico de doces e me manda.\n"
+    .. "• Porta pegando fogo vira portal pro boss Hellfire Gas. Desliga o farm de portas se não quiser lutar.")
   section(info, "CONTROLES")
   para(info, "– minimiza pra abóbora flutuante (arrasta e toca pra abrir).\n× fecha o hub (toca duas vezes).")
 
@@ -1457,6 +1763,7 @@ local function buildWindow(gui)
       rows.status.Text = State.status
       rows.opened.Text = tostring(Stats.opened)
       rows.jacks.Text = tostring(Stats.jacks)
+      rows.bosses.Text = tostring(Stats.bosses)
       rows.free.Text = free .. " / " .. #State.pumpkins
       rows.click.Text = MODE_LABEL[MODES[State.modeIndex]] .. (State.modeConfirmed and " (ok)" or " (testando)")
       rows.aura.Text = State.jackMode or (Hit.ok and ("remoto " .. Hit.mode .. " (ok)") or "aguardando Jack")
@@ -1480,6 +1787,8 @@ local function buildWindow(gui)
       end
       local endLeft = EVENT_END - os.time()
       er.ends.Text = endLeft > 0 and fmt(endLeft) or "acabou"
+      er.doors.Text = Doors.scanning and "procurando..." or tostring(#Doors.list)
+      er.doorsDone.Text = Doors.done .. " / " .. #Doors.list
       er.gain.Text = "+" .. Event.gain.candy .. " candy • +" .. Event.gain.bits .. " bits"
       if Event.totalOk then
         er.candy.Text = Event.candy .. " / 5000"
@@ -1522,6 +1831,7 @@ if State.running then
   buildWindow(gui)
   startLoops()
   startEventLoop()
+  startDoorLoop()
   State.status = "parado"
   notify("Bem-vindo, " .. LP.DisplayName .. "!", "Claude Hub v" .. VERSION .. " • Feliz Halloween", "ok", 4)
   if not checks.hunt then notify("Abóboras não achadas", "Chega perto de uma ilha com abóboras", "warn", 5) end
