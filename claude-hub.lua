@@ -26,7 +26,7 @@ local VirtualUser  = game:GetService("VirtualUser")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "1.1"
+local VERSION = "1.1.1"
 
 local Config = {
   FarmPumpkins   = false,
@@ -206,14 +206,17 @@ end
 ------------------------------------------------------------------
 -- KILLAURA REMOTO
 ------------------------------------------------------------------
-local Hit = {attack = nil, hit = nil, mode = 1, ok = false}
+local Hit = {attack = nil, hit = nil, mode = 1, ok = false, required = false}
 
 local function getHitRemotes()
   if Hit.attack and Hit.hit and Hit.attack.Parent and Hit.hit.Parent then return true end
   local mods = RS:FindFirstChild("Modules")
   local net = mods and mods:FindFirstChild("Net")
   if not net then return false end
-  pcall(function() require(net):RemoteEvent("RegisterHit", true) end)
+  if not Hit.required then
+    Hit.required = true
+    task.spawn(pcall, function() require(net):RemoteEvent("RegisterHit", true) end)
+  end
   Hit.attack = net:FindFirstChild("RE/RegisterAttack")
   Hit.hit = net:FindFirstChild("RE/RegisterHit")
   return Hit.attack ~= nil and Hit.hit ~= nil
@@ -875,8 +878,20 @@ local function runLoading(gui, steps)
   task.wait(0.5)
   for i, s in ipairs(steps) do
     stepL.Text = s[1]
-    local ok, err = pcall(s[2])
-    if not ok then warn("[Claude Hub] " .. s[1] .. " " .. tostring(err)) end
+    local done, ok, err = false, true, nil
+    task.spawn(function()
+      ok, err = pcall(s[2])
+      done = true
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < 6 do task.wait(0.05) end
+    if not done then
+      warn("[Claude Hub] etapa demorou demais, pulando: " .. s[1])
+      stepL.Text = s[1] .. " (pulado)"
+      task.wait(0.3)
+    elseif not ok then
+      warn("[Claude Hub] " .. s[1] .. " " .. tostring(err))
+    end
     tween(fill, 0.35, {Size = UDim2.fromScale(i / #steps, 1)})
     pct.Text = math.floor(i / #steps * 100) .. "%"
     task.wait(0.3 + math.random() * 0.3)
