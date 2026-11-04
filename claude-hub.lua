@@ -26,7 +26,7 @@ local VirtualUser  = game:GetService("VirtualUser")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "1.1.1"
+local VERSION = "1.3"
 
 local Config = {
   FarmPumpkins   = false,
@@ -35,6 +35,9 @@ local Config = {
   JackFallback   = true,
   AntiAFK        = true,
   NotifyPumpkins = false,
+  AutoMinimize   = true,
+  AutoMode       = true,   -- testa outro modo de soco se o atual não registrar
+  AllowMouse     = false,  -- mouse VIM faz o Roblox virar layout de PC no celular   -- minimiza o hub ao ligar o farm (o clique não acerta o menu)
 
   TweenSpeed   = 300,
   HitDistance  = 3.5,
@@ -54,13 +57,17 @@ local Config = {
   Weapon       = "",
 }
 
-local MODES = {"Activate", "VIM", "Touch", "VirtualUser"}
+local MODES = {"Touch", "Activate", "Remote", "VirtualUser", "Mouse"}
+local MODE_LABEL = {
+  Touch = "Toque (mobile)", Activate = "Activate (ferramenta)", Remote = "Remote (hit direto)",
+  VirtualUser = "VirtualUser", Mouse = "Mouse VIM (vira PC)",
+}
 local State = {
   running = true, active = false, lock = nil, gui = nil,
   pumpkins = {}, done = setmetatable({}, {__mode = "k"}), jackQueue = {},
-  modeIndex = VIM and 2 or 1, modeConfirmed = false, switches = 0,
+  modeIndex = VIM and 1 or 2, modeConfirmed = false, switches = 0, modeRefresh = nil,
   status = "carregando", lastOpenPos = nil, lastOpenTime = 0,
-  jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0,
+  jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0, avoid = {},
 }
 local Stats = {opened = 0, jacks = 0, start = os.clock()}
 
@@ -157,23 +164,58 @@ local function equip()
   return tool
 end
 
-local function click()
+-- o clique simulado nunca pode cair em cima do hub: era isso que desligava o farm
+local SPOTS = {{0.5, 0.45}, {0.5, 0.25}, {0.72, 0.3}, {0.28, 0.3}, {0.5, 0.7}, {0.82, 0.5}}
+local function overUI(x, y)
+  for _, g in ipairs(State.avoid) do
+    if g.Parent and g.Visible and g.AbsoluteSize.Y > 0 then
+      local p, s = g.AbsolutePosition, g.AbsoluteSize
+      if x >= p.X - 14 and x <= p.X + s.X + 14 and y >= p.Y - 14 and y <= p.Y + s.Y + 14 then return true end
+    end
+  end
+  return false
+end
+local function clickPoint(vp)
+  for _, c in ipairs(SPOTS) do
+    local x, y = vp.X * c[1] + math.random(-10, 10), vp.Y * c[2] + math.random(-10, 10)
+    if not overUI(x, y) then return x, y end
+  end
+  return nil
+end
+
+local remoteHit -- definido no killaura, mais abaixo
+
+local function modeUsable(m)
+  if (m == "Touch" or m == "Mouse") and not VIM then return false end
+  if m == "Mouse" and not Config.AllowMouse then return false end
+  return true
+end
+
+-- target/part: o alvo atual (usado só no modo Remote)
+local function click(target, part)
   local mode = MODES[State.modeIndex]
   local tool = equip()
   local cam = workspace.CurrentCamera
-  local vp = cam.ViewportSize
-  local x = vp.X * 0.5 + math.random(-12, 12)
-  local y = vp.Y * 0.45 + math.random(-12, 12)
-  if mode == "Activate" and tool then
-    tool:Activate()
-  elseif mode == "VIM" and VIM then
-    VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
-    task.wait(0.02 + math.random() * 0.04)
-    VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
-  elseif mode == "Touch" and VIM then
+  if mode == "Remote" then
+    if target and remoteHit and remoteHit(target, part) then return end
+    mode = "Activate"
+  end
+  if not modeUsable(mode) then mode = "Activate" end
+  local x, y
+  if mode ~= "Activate" then
+    x, y = clickPoint(cam.ViewportSize)
+    if not x then mode = "Activate" end
+  end
+  if mode == "Activate" then
+    if tool then tool:Activate() end
+  elseif mode == "Touch" then
     VIM:SendTouchEvent(7, 0, x, y)
     task.wait(0.03 + math.random() * 0.04)
     VIM:SendTouchEvent(7, 2, x, y)
+  elseif mode == "Mouse" then
+    VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+    task.wait(0.02 + math.random() * 0.04)
+    VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
   else
     VirtualUser:CaptureController()
     VirtualUser:ClickButton1(Vector2.new(x, y), cam.CFrame)
@@ -191,16 +233,23 @@ end
 local function confirmMode()
   if not State.modeConfirmed then
     State.modeConfirmed = true
-    log("clique confirmado: " .. MODES[State.modeIndex])
-    notify("Clique confirmado", "Modo " .. MODES[State.modeIndex] .. " registrando os socos", "ok")
+    local label = MODE_LABEL[MODES[State.modeIndex]]
+    log("soco confirmado: " .. label)
+    notify("Soco confirmado", label .. " registrando os socos", "ok")
+    if State.modeRefresh then State.modeRefresh() end
   end
 end
 
 local function nextMode()
-  State.modeIndex = State.modeIndex % #MODES + 1
+  for _ = 1, #MODES do
+    State.modeIndex = State.modeIndex % #MODES + 1
+    if modeUsable(MODES[State.modeIndex]) then break end
+  end
   State.switches = State.switches + 1
-  log("testando clique " .. MODES[State.modeIndex])
-  notify("Trocando modo de clique", "Testando " .. MODES[State.modeIndex], "warn")
+  local label = MODE_LABEL[MODES[State.modeIndex]]
+  log("testando soco " .. label)
+  notify("Trocando modo de soco", "Testando " .. label, "warn")
+  if State.modeRefresh then State.modeRefresh() end
 end
 
 ------------------------------------------------------------------
@@ -222,8 +271,8 @@ local function getHitRemotes()
   return Hit.attack ~= nil and Hit.hit ~= nil
 end
 
-local function remoteHit(m)
-  local head = m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+remoteHit = function(m, part)
+  local head = part or m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
   if not (head and getHitRemotes()) then return false end
   local list = {{m, head}}
   Hit.attack:FireServer(0)
@@ -417,7 +466,7 @@ local function killJack(m)
     State.jackMode = useClick and "clique" or ("remoto " .. Hit.mode)
     if os.clock() - t0 > 60 then log("Jack demorou demais") break end
     if useClick then
-      pcall(click)
+      pcall(click, m, m:FindFirstChild("Head") or hrp)
       humanPause(0.7)
     else
       equip()
@@ -480,7 +529,7 @@ local function farmPumpkin(t)
   for _ = 1, Config.MaxClicks do
     if not (State.running and State.active and Config.FarmPumpkins and alive()) then break end
     if Config.KillJack and findJack() then State.lock = nil return end
-    pcall(click)
+    pcall(click, t.key:IsA("Model") and t.key or t.key.Parent, t.parts[1])
     humanPause()
     local opened, hit, now = compare(t, base, prev)
     if now then prev = now end
@@ -500,7 +549,7 @@ local function farmPumpkin(t)
       State.lock = nil
       return
     end
-    if not State.modeConfirmed and noHit >= Config.SwitchAfter then
+    if Config.AutoMode and not State.modeConfirmed and noHit >= Config.SwitchAfter then
       nextMode()
       noHit = 0
     end
@@ -626,10 +675,20 @@ local function readEvent()
     end
   end
   if not found.candy then
+    local ok, attrs = pcall(function() return LP:GetAttributes() end)
+    if ok then
+      for k, v in pairs(attrs) do
+        local l = string.lower(k):gsub("[%s_%-]", "")
+        if type(v) == "number" and (l:find("candycorn", 1, true) or l == "candy") then found.candy = v end
+      end
+    end
+  end
+  if not found.candy then
     local data = LP:FindFirstChild("Data")
     if data then
-      for _, v in ipairs(data:GetChildren()) do
-        if v:IsA("ValueBase") and string.lower(v.Name):find("candy", 1, true) then found.candy = tonumber(v.Value) end
+      for _, v in ipairs(data:GetDescendants()) do
+        local l = string.lower(v.Name):gsub("[%s_%-]", "")
+        if v:IsA("ValueBase") and (l:find("candycorn", 1, true) or l == "candy") then found.candy = tonumber(v.Value) end
       end
     end
   end
@@ -649,6 +708,76 @@ local function readEvent()
     notify("Great Pumpkin liberada!", "200 bits + 3 sementes: fala com a Witch", "ok", 6)
   end
   return true
+end
+
+local function shallow(t)
+  local p = {}
+  for k, v in pairs(t) do
+    if #p >= 10 then p[#p + 1] = "..." break end
+    p[#p + 1] = tostring(k) .. "=" .. (type(v) == "table" and "{tabela}" or tostring(v))
+  end
+  return "{" .. table.concat(p, ", ") .. "}"
+end
+
+local function candyDiag()
+  local out = {}
+  local function add(s) out[#out + 1] = tostring(s) end
+  local function hot(s)
+    s = string.lower(tostring(s)):gsub("[%s_%-]", "")
+    return s:find("candy", 1, true) or s:find("pumpkin", 1, true) or s:find("corn", 1, true)
+  end
+  local remotes = RS:FindFirstChild("Remotes")
+  local comm = remotes and remotes:FindFirstChild("CommF_")
+  add("CommF_: " .. tostring(comm ~= nil))
+  if comm then
+    local ok, inv = pcall(function() return comm:InvokeServer("getInventory") end)
+    add("getInventory ok=" .. tostring(ok) .. " tipo=" .. typeof(inv))
+    if ok and type(inv) == "table" then
+      local n, shown = 0, 0
+      for k, e in pairs(inv) do
+        n = n + 1
+        local line = tostring(k) .. " -> " .. (type(e) == "table" and shallow(e) or tostring(e))
+        if n <= 3 then add("  item " .. n .. ": " .. line)
+        elseif hot(line) and shown < 12 then shown = shown + 1 add("  achado: " .. line) end
+      end
+      add("  total de itens: " .. n)
+    elseif not ok then
+      add("  erro: " .. tostring(inv))
+    end
+  end
+  local okA, attrs = pcall(function() return LP:GetAttributes() end)
+  if okA then
+    local a = {}
+    for k, v in pairs(attrs) do a[#a + 1] = k .. "=" .. tostring(v) end
+    add("atributos do player: " .. (#a > 0 and table.concat(a, ", ") or "nenhum"))
+  end
+  local data = LP:FindFirstChild("Data")
+  if data then
+    local d = {}
+    for _, v in ipairs(data:GetChildren()) do
+      if #d >= 40 then d[#d + 1] = "..." break end
+      d[#d + 1] = v.Name .. (v:IsA("ValueBase") and ("=" .. tostring(v.Value)) or "")
+    end
+    add("Data: " .. table.concat(d, ", "))
+  else
+    add("Data: nao existe")
+  end
+  local pg = LP:FindFirstChild("PlayerGui")
+  if pg then
+    local c = 0
+    for _, g in ipairs(pg:GetDescendants()) do
+      if (g:IsA("TextLabel") or g:IsA("TextButton")) and hot(g.Text) and c < 12 then
+        c = c + 1
+        add("tela: " .. g:GetFullName() .. " = " .. string.sub(g.Text, 1, 60))
+      end
+    end
+    add("textos de doce na tela: " .. c)
+  end
+  local text = table.concat(out, "\n")
+  if #text > 8000 then text = string.sub(text, 1, 8000) .. "\n[cortado]" end
+  print("[Claude Hub] diagnostico de doces:\n" .. text)
+  local copied = setclipboard and pcall(setclipboard, text)
+  return copied
 end
 
 local function startEventLoop()
@@ -782,6 +911,7 @@ local function buildToasts(gui)
   local box = new("Frame", {AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 70),
     Size = UDim2.fromOffset(250, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
     ZIndex = 30, Parent = gui})
+  table.insert(State.avoid, box)
   new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = box})
   local KIND = {
     info = {T.purple, "👻"}, ok = {T.green, "🎃"}, warn = {T.orange, "⚠️"}, err = {T.red, "💀"},
@@ -916,6 +1046,8 @@ local function buildWindow(gui)
   corner(win, 14) stroke(win, T.orange, 1.2, 0.45)
   new("UIGradient", {Color = ColorSequence.new(T.bg, T.bg2), Rotation = 90, Parent = win})
   local scale = new("UIScale", {Scale = 0, Parent = win})
+  local minimizeFn
+  table.insert(State.avoid, win)
   local function fit()
     local vp = workspace.CurrentCamera.ViewportSize
     return math.min(1, (vp.X - 30) / W, (vp.Y - 30) / H)
@@ -1104,6 +1236,14 @@ local function buildWindow(gui)
   toggle(farm, "Farm de Abóbora", "Tween + clique humano até abrir", "FarmPumpkins", function(on)
     notify(on and "Farm ligado" or "Farm desligado", on and "Indo atrás das abóboras" or "Personagem liberado",
       on and "ok" or "info", 2)
+    if on and Config.AutoMinimize and minimizeFn then
+      task.delay(0.8, function()
+        if Config.FarmPumpkins then
+          minimizeFn()
+          notify("Hub minimizado", "Pro clique não acertar o menu. Toca na 🎃 pra abrir", "info", 4)
+        end
+      end)
+    end
   end)
   toggle(farm, "Avisar cada abóbora", nil, "NotifyPumpkins")
   section(farm, "JACK O'LANTERN")
@@ -1129,6 +1269,12 @@ local function buildWindow(gui)
   section(ev, "GACHA E BOSS")
   er.rolls  = statRow(ev, "Rolls no Spooky Gacha")
   er.gp     = statRow(ev, "Great Pumpkin")
+  button(ev, "🔍  Diagnóstico de doces", function()
+    task.spawn(function()
+      if candyDiag() then notify("Diagnóstico copiado", "Cola aqui no chat pro Claude", "ok", 5)
+      else notify("Diagnóstico no console", "Abre o console e me manda", "info", 5) end
+    end)
+  end)
   button(ev, "🔄  Atualizar doces agora", function()
     task.spawn(function()
       if readEvent() then notify("Doces atualizados", "Candy Corn: " .. tostring(Event.candy), "ok", 2)
@@ -1138,6 +1284,49 @@ local function buildWindow(gui)
 
   -- página: Ajustes
   local cfg = page("cfg", "⚙️  Ajustes")
+  section(cfg, "INTERFACE")
+  toggle(cfg, "Minimizar ao ligar o farm", "Evita o clique cair no menu", "AutoMinimize")
+  section(cfg, "MODO DE SOCO")
+  local modeBtns = {}
+  for i, key in ipairs(MODES) do
+    local b = new("TextButton", {Text = "", AutoButtonColor = false, BackgroundColor3 = T.card,
+      Size = UDim2.new(1, 0, 0, 32), LayoutOrder = nxt(), Parent = cfg})
+    corner(b, 8)
+    local dot = new("Frame", {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0),
+      Size = UDim2.fromOffset(12, 12), BackgroundColor3 = T.panel, BorderSizePixel = 0, Parent = b})
+    corner(dot, 6) stroke(dot, T.orange, 1, 0.3)
+    local lbl = new("TextLabel", {Text = MODE_LABEL[key], Font = F.semi, TextSize = 12, TextColor3 = T.text,
+      BackgroundTransparency = 1, Position = UDim2.fromOffset(30, 0), Size = UDim2.new(1, -40, 1, 0),
+      TextXAlignment = Enum.TextXAlignment.Left, Parent = b})
+    modeBtns[i] = {b = b, dot = dot, lbl = lbl}
+    b.MouseButton1Click:Connect(function()
+      if not modeUsable(key) then
+        notify("Modo indisponível", key == "Mouse" and "Liga 'Permitir Mouse' aqui embaixo" or "Teu executor não tem VIM", "warn", 3)
+        return
+      end
+      State.modeIndex, State.modeConfirmed = i, true
+      notify("Modo de soco", MODE_LABEL[key], "ok", 2)
+      State.modeRefresh()
+    end)
+  end
+  State.modeRefresh = function()
+    for i, r in ipairs(modeBtns) do
+      local sel = i == State.modeIndex
+      r.dot.BackgroundColor3 = sel and T.orange or T.panel
+      r.b.BackgroundColor3 = sel and T.bg2 or T.card
+      r.lbl.TextColor3 = modeUsable(MODES[i]) and T.text or T.dim
+    end
+  end
+  State.modeRefresh()
+  toggle(cfg, "Trocar sozinho", "Se o soco não registrar, testa o próximo", "AutoMode")
+  toggle(cfg, "Permitir Mouse", "O Roblox vira layout de PC", "AllowMouse", function(on)
+    if not on and MODES[State.modeIndex] == "Mouse" then nextMode() end
+    State.modeRefresh()
+  end)
+  button(cfg, "🔁  Testar modos de novo", function()
+    State.modeConfirmed, State.switches = false, 0
+    notify("Testando de novo", "Começando por " .. MODE_LABEL[MODES[State.modeIndex]], "info", 3)
+  end)
   section(cfg, "MOVIMENTO")
   slider(cfg, "Velocidade do tween", "TweenSpeed", 150, 350, 10, " st/s")
   slider(cfg, "Distância da abóbora", "HitDistance", 2, 6, 0.5, " st")
@@ -1148,10 +1337,7 @@ local function buildWindow(gui)
   section(cfg, "CLIQUE HUMANO")
   slider(cfg, "Intervalo mínimo", "ClickMin", 0.08, 0.3, 0.01, "s")
   slider(cfg, "Intervalo máximo", "ClickMax", 0.12, 0.5, 0.01, "s")
-  button(cfg, "🔁  Trocar modo de clique", function()
-    State.modeConfirmed = false
-    nextMode()
-  end)
+
 
   -- página: Status
   local st = page("stats", "📊  Status")
@@ -1172,7 +1358,7 @@ local function buildWindow(gui)
   section(info, "AVISOS")
   para(info, "• Use em conta alternativa: farm automático pode dar ban.\n"
     .. "• O evento acaba 15/11 às 01:00 UTC (22:00 de 14/11 em Brasília).\n"
-    .. "• Soco não registra? Ajustes → Trocar modo de clique.\n"
+    .. "• Soco não registra ou a tela vira PC? Ajustes → Modo de soco.\n"
     .. "• Killaura sem dano? Me manda o console.\n"
     .. "• Doces aparecendo errado? Me manda a linha 'inventario: campos' do console.")
   section(info, "CONTROLES")
@@ -1185,16 +1371,19 @@ local function buildWindow(gui)
     AutoButtonColor = false, Size = UDim2.fromOffset(50, 50), Position = UDim2.new(0, 16, 0.5, -25),
     Visible = false, Parent = gui})
   corner(fab, 25) stroke(fab, T.orange, 2, 0)
+  table.insert(State.avoid, fab)
   local function restore()
     fab.Visible = false
     win.Visible = true
     tween(scale, 0.35, {Scale = fit()}, Enum.EasingStyle.Back)
   end
   makeDraggable(fab, fab, restore)
-  minB.MouseButton1Click:Connect(function()
+  minimizeFn = function()
+    if not win.Visible then return end
     tween(scale, 0.25, {Scale = 0})
     task.delay(0.26, function() win.Visible = false fab.Visible = true end)
-  end)
+  end
+  minB.MouseButton1Click:Connect(minimizeFn)
   local armed = false
   closeB.MouseButton1Click:Connect(function()
     if armed then Stop() return end
@@ -1216,7 +1405,7 @@ local function buildWindow(gui)
       rows.opened.Text = tostring(Stats.opened)
       rows.jacks.Text = tostring(Stats.jacks)
       rows.free.Text = free .. " / " .. #State.pumpkins
-      rows.click.Text = MODES[State.modeIndex] .. (State.modeConfirmed and " (ok)" or " (testando)")
+      rows.click.Text = MODE_LABEL[MODES[State.modeIndex]] .. (State.modeConfirmed and " (ok)" or " (testando)")
       rows.aura.Text = State.jackMode or (Hit.ok and ("remoto " .. Hit.mode .. " (ok)") or "aguardando Jack")
       rows.time.Text = string.format("%02d:%02d:%02d", math.floor(s / 3600), math.floor(s / 60) % 60, s % 60)
 
@@ -1280,7 +1469,7 @@ if State.running then
   notify("Bem-vindo, " .. LP.DisplayName .. "!", "Claude Hub v" .. VERSION .. " • Feliz Halloween", "ok", 4)
   if not checks.hunt then notify("Abóboras não achadas", "Chega perto de uma ilha com abóboras", "warn", 5) end
   if not checks.remote then notify("Remote de hit não achado", "O Jack vai ser no clique", "warn", 5) end
-  if not checks.vim then notify("Sem VirtualInputManager", "O clique vai usar Activate", "warn", 5) end
+  if not checks.vim then notify("Sem VirtualInputManager", "O soco vai usar Activate/Remote", "warn", 5) end
   if not checks.inv then notify("Doces não lidos", "Tento de novo a cada 20s", "warn", 5) end
   local active, left = moonInfo()
   task.delay(2.4, function()
