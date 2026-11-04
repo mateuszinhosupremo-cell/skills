@@ -9,6 +9,8 @@
   - aba Evento: contagem da Harvest Moon, fim do evento, Candy Corn,
     Pumpkin Bits, sementes, rolls do gacha e Great Pumpkin
   - tela de carregamento, avisos, abas, sliders, minimizar
+  v2.0: painel inicial, configurações salvas, tween anti-puxão,
+        rota de abóboras pelas ilhas, mini HUD, modo economia/FPS
 
   Se o executor não aceitar colar tudo: salva este arquivo na pasta
   "workspace" do executor e roda:  loadstring(readfile("claude_hub.txt"))()
@@ -23,10 +25,12 @@ local TweenService = game:GetService("TweenService")
 local UIS          = game:GetService("UserInputService")
 local RS           = game:GetService("ReplicatedStorage")
 local VirtualUser  = game:GetService("VirtualUser")
+local HttpService  = game:GetService("HttpService")
+local Lighting     = game:GetService("Lighting")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "1.6"
+local VERSION = "2.0"
 
 local Config = {
   FarmPumpkins   = false,
@@ -40,6 +44,11 @@ local Config = {
   AllowMouse     = false,
   AutoDoors      = false,  -- bate nas portas durante a Harvest Moon
   AutoBosses     = true,   -- mata Unbound Werewolf e Hellfire Gas quando aparecem
+  SmartTween     = true,   -- se o server puxar de volta, reduz a velocidade sozinho
+  PumpkinRoute   = true,   -- sem abóbora por perto, volta onde já viu uma
+  RouteWait      = 1.5,    -- s esperando a área carregar na rota
+  BatterySaver   = false,  -- tela preta: para de desenhar o 3D
+  BoostFPS       = false,  -- gráfico no mínimo
   BossKeys       = {"werewolf", "hellfire", "hellrider", "unbound"},
   BossRadius     = 3000,
   BossTimeout    = 600,    -- os dois somem depois de ~10 min
@@ -78,14 +87,78 @@ local State = {
   modeIndex = 3, modeConfirmed = true, switches = 0, modeRefresh = nil, -- 3 = Remote
   status = "carregando", lastOpenPos = nil, lastOpenTime = 0,
   jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0, avoid = {},
+  speed = nil, lastSnap = 0, lastSnapNote = 0, memory = {}, memCount = 0,
 }
-local Stats = {opened = 0, jacks = 0, bosses = 0, start = os.clock()}
+local Stats = {opened = 0, jacks = 0, bosses = 0, deaths = 0, start = os.clock()}
 
 local notify = function() end -- a UI troca isso pelos avisos de verdade
 
 local function log(msg)
   State.status = msg
   print("[Claude Hub] " .. msg)
+end
+
+------------------------------------------------------------------
+-- CONFIGURAÇÕES SALVAS + DESEMPENHO
+------------------------------------------------------------------
+local CFG_FILE = "ClaudeHub_config.json"
+local lastSaved = ""
+
+local function saveable()
+  local t = {}
+  for k, v in pairs(Config) do
+    if type(v) == "boolean" or type(v) == "number" then t[k] = v end
+  end
+  t._mode, t._modeOk = State.modeIndex, State.modeConfirmed
+  return t
+end
+
+local function saveConfig()
+  if State.noSave or not writefile then return false end
+  local ok, json = pcall(function() return HttpService:JSONEncode(saveable()) end)
+  if ok and json ~= lastSaved and pcall(writefile, CFG_FILE, json) then
+    lastSaved = json
+    return true
+  end
+  return false
+end
+
+local function loadConfig()
+  if not (isfile and readfile) then return false end
+  local ok, data = pcall(function()
+    if not isfile(CFG_FILE) then return nil end
+    return HttpService:JSONDecode(readfile(CFG_FILE))
+  end)
+  if not ok or type(data) ~= "table" then return false end
+  for k, v in pairs(data) do
+    if Config[k] ~= nil and type(Config[k]) == type(v) then Config[k] = v end
+  end
+  if type(data._mode) == "number" and MODES[data._mode] then State.modeIndex = data._mode end
+  if type(data._modeOk) == "boolean" then State.modeConfirmed = data._modeOk end
+  return true
+end
+
+local Perf = {saved = nil}
+local function applyPerf()
+  pcall(function() RunService:Set3dRenderingEnabled(not Config.BatterySaver) end)
+  if Config.BoostFPS then
+    if not Perf.saved then
+      Perf.saved = {shadows = Lighting.GlobalShadows, fog = Lighting.FogEnd}
+      pcall(function() Perf.saved.quality = settings().Rendering.QualityLevel end)
+      pcall(function() Perf.saved.deco = workspace.Terrain.Decoration end)
+    end
+    pcall(function() Lighting.GlobalShadows = false end)
+    pcall(function() Lighting.FogEnd = 1e6 end)
+    pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+    pcall(function() workspace.Terrain.Decoration = false end)
+  elseif Perf.saved then
+    local s = Perf.saved
+    pcall(function() Lighting.GlobalShadows = s.shadows end)
+    pcall(function() Lighting.FogEnd = s.fog end)
+    if s.quality then pcall(function() settings().Rendering.QualityLevel = s.quality end) end
+    if s.deco ~= nil then pcall(function() workspace.Terrain.Decoration = s.deco end) end
+    Perf.saved = nil
+  end
 end
 
 local function getChar() return LP.Character end
@@ -126,22 +199,49 @@ table.insert(State.conns, RunService.Heartbeat:Connect(function()
   end
 end))
 
-local function tweenTo(cf)
+local function curSpeed()
+  if not State.speed or State.speed > Config.TweenSpeed then State.speed = Config.TweenSpeed end
+  return State.speed
+end
+
+-- tween anti-puxão: se o server te jogar pra trás no meio do caminho,
+-- baixa a velocidade e tenta de novo de onde parou
+local function tweenTo(cf, tries)
   local root = getRoot()
   if not root then return false end
   State.lock = nil
   local dist = (root.Position - cf.Position).Magnitude
   if dist < 8 then root.CFrame = cf return true end
-  local dur = dist / Config.TweenSpeed
+  local speed = curSpeed()
+  local dur = dist / speed
   local tw = TweenService:Create(root, TweenInfo.new(dur, Enum.EasingStyle.Linear), {CFrame = cf})
   tw:Play()
-  local t0 = os.clock()
+  local t0, last, snapped = os.clock(), root.Position, false
   while tw.PlaybackState == Enum.PlaybackState.Playing do
     if not (State.running and State.active and alive()) or os.clock() - t0 > dur + 3 then
       tw:Cancel()
       break
     end
-    task.wait()
+    local dt = task.wait()
+    local now = root.Position
+    if Config.SmartTween and (now - last).Magnitude > math.max(25, speed * dt * 4) then
+      snapped = true
+      tw:Cancel()
+      break
+    end
+    last = now
+  end
+  if snapped then
+    State.speed = math.max(150, speed - 25)
+    State.lastSnap = os.clock()
+    log("server puxou de volta, velocidade " .. State.speed)
+    if os.clock() - State.lastSnapNote > 6 then
+      State.lastSnapNote = os.clock()
+      notify("Puxão do servidor", "Velocidade ajustada pra " .. State.speed .. " st/s", "warn", 3)
+    end
+    task.wait(0.6)
+    if (tries or 0) < 3 then return tweenTo(cf, (tries or 0) + 1) end
+    return false
   end
   return alive() and State.active
 end
@@ -176,9 +276,18 @@ end
 
 -- o clique simulado nunca pode cair em cima do hub: era isso que desligava o farm
 local SPOTS = {{0.5, 0.45}, {0.5, 0.25}, {0.72, 0.3}, {0.28, 0.3}, {0.5, 0.7}, {0.82, 0.5}}
+local function isShown(g)
+  local cur = g
+  while cur and cur:IsA("GuiObject") do
+    if not cur.Visible then return false end
+    cur = cur.Parent
+  end
+  return true
+end
+
 local function overUI(x, y)
   for _, g in ipairs(State.avoid) do
-    if g.Parent and g.Visible and g.AbsoluteSize.Y > 0 then
+    if g.Parent and isShown(g) and g.AbsoluteSize.Y > 0 then
       local p, s = g.AbsolutePosition, g.AbsoluteSize
       if x >= p.X - 14 and x <= p.X + s.X + 14 and y >= p.Y - 14 and y <= p.Y + s.Y + 14 then return true end
     end
@@ -326,11 +435,30 @@ local function collect(inst, out, depth)
   for _, ch in ipairs(inst:GetChildren()) do collect(ch, out, depth + 1) end
 end
 
+local function memKey(p)
+  return math.floor(p.X / 6 + 0.5) .. "," .. math.floor(p.Y / 6 + 0.5) .. "," .. math.floor(p.Z / 6 + 0.5)
+end
+
 local function scanPumpkins()
   local hunt = workspace:FindFirstChild("PumpkinHunt")
   local out = {}
   if hunt then
     for _, ch in ipairs(hunt:GetChildren()) do collect(ch, out, 1) end
+  end
+  -- memória: lembra onde já viu abóbora (o mapa descarrega o que tá longe)
+  for _, t in ipairs(out) do
+    local c = center(t.parts)
+    if c then
+      local k = memKey(c)
+      local e = State.memory[k]
+      if e then
+        e.seen = os.clock()
+      elseif State.memCount < 500 then
+        State.memory[k] = {pos = c, seen = os.clock()}
+        State.memCount = State.memCount + 1
+      end
+      t.mem = k
+    end
   end
   State.pumpkins = out
 end
@@ -383,6 +511,36 @@ local function nearestPumpkin()
     end
   end
   return best
+end
+
+-- rota: sem abóbora livre carregada, volta num lugar onde já viu uma
+local function routePumpkin()
+  if not Config.PumpkinRoute then return false end
+  local root = getRoot()
+  if not root then return false end
+  local now, best, bd = os.clock(), nil, math.huge
+  for _, e in pairs(State.memory) do
+    local free = not (e.done and now - e.done < Config.Cooldown) and not (e.emptyUntil and now < e.emptyUntil)
+    if free then
+      local d = (e.pos - root.Position).Magnitude
+      if d < bd then best, bd = e, d end
+    end
+  end
+  if not best then return false end
+  State.status = "rota: indo onde tinha abóbora"
+  local spot = CFrame.new(best.pos + Vector3.new(0, 4, 0))
+  if not tweenTo(spot) then
+    best.emptyUntil = os.clock() + 60
+    return true
+  end
+  State.lock = spot
+  task.wait(Config.RouteWait)
+  pcall(scanPumpkins)
+  State.lock = nil
+  local t = nearestPumpkin()
+  local c = t and center(t.parts)
+  if not (c and (c - best.pos).Magnitude < 25) then best.emptyUntil = os.clock() + 180 end
+  return true
 end
 
 ------------------------------------------------------------------
@@ -603,7 +761,10 @@ local function farmPumpkin(t)
   local cf = CFrame.lookAt(stand, Vector3.new(tpos.X, stand.Y, tpos.Z))
 
   log("indo até a abóbora")
-  if not tweenTo(cf) then return end
+  if not tweenTo(cf) then
+    State.done[t.key] = os.clock() - Config.Cooldown + 20
+    return
+  end
   State.lock = cf
 
   local base = snapshot(t)
@@ -619,6 +780,7 @@ local function farmPumpkin(t)
     if opened then
       confirmMode()
       State.done[t.key] = os.clock()
+      if t.mem and State.memory[t.mem] then State.memory[t.mem].done = os.clock() end
       State.lastOpenPos, State.lastOpenTime = tpos, os.clock()
       Stats.opened = Stats.opened + 1
       log("abóbora aberta (" .. Stats.opened .. ")")
@@ -638,6 +800,7 @@ local function farmPumpkin(t)
   end
   State.lock = nil
   State.done[t.key] = os.clock() - Config.Cooldown + 30
+  if t.mem and State.memory[t.mem] then State.memory[t.mem].done = os.clock() - Config.Cooldown + 30 end
 end
 
 ------------------------------------------------------------------
@@ -659,6 +822,8 @@ local function step()
   if Config.FarmPumpkins then
     local t = nearestPumpkin()
     if t then State.active = true farmPumpkin(t) return end
+    State.active = true
+    if routePumpkin() then return end
     State.status = "nenhuma abóbora livre"
   else
     State.status = "parado"
@@ -667,13 +832,31 @@ local function step()
   State.lock = nil
 end
 
+local function hookDeath(char)
+  local hum = char:WaitForChild("Humanoid", 10)
+  if not hum then return end
+  table.insert(State.conns, hum.Died:Connect(function()
+    Stats.deaths = Stats.deaths + 1
+    State.lock = nil
+    notify("Você morreu", "Continuo quando tu renascer", "err", 4)
+  end))
+end
+
 local function startLoops()
   task.spawn(function()
+    local n = 0
     while State.running do
       pcall(scanPumpkins)
+      n = n + 1
+      if n % 15 == 0 and State.speed and State.speed < Config.TweenSpeed and os.clock() - State.lastSnap > 120 then
+        State.speed = math.min(Config.TweenSpeed, State.speed + 10)
+      end
+      if n % 3 == 0 then pcall(saveConfig) end
       task.wait(2)
     end
   end)
+  if LP.Character then task.spawn(hookDeath, LP.Character) end
+  table.insert(State.conns, LP.CharacterAdded:Connect(function(c) task.spawn(hookDeath, c) end))
   task.spawn(function()
     while State.running do
       local ok, err = pcall(step)
@@ -1136,7 +1319,8 @@ local function startDoorLoop()
     local wasActive = false
     while State.running do
       local active = moonInfo()
-      if (active and not wasActive) or os.clock() - Doors.lastScan > 60 or #Doors.list == 0 then
+      local stale = os.clock() - Doors.lastScan > (#Doors.list == 0 and 30 or 120)
+      if (active and not wasActive) or (stale and (Config.AutoDoors or active)) or Doors.lastScan == 0 then
         pcall(scanDoors)
         if active and not wasActive and Config.AutoDoors then
           notify("Farm de portas", #Doors.list .. " portas pra bater nesta lua", "ok", 4)
@@ -1149,6 +1333,9 @@ local function startDoorLoop()
 end
 
 local function Stop()
+  pcall(saveConfig)
+  Config.BatterySaver, Config.BoostFPS = false, false
+  pcall(applyPerf)
   State.running, State.active, State.lock = false, false, nil
   for _, c in ipairs(State.conns) do pcall(function() c:Disconnect() end) end
   for p, v in pairs(savedCollide) do if p.Parent then p.CanCollide = v end end
@@ -1382,6 +1569,11 @@ end
 -- UI: JANELA PRINCIPAL
 ------------------------------------------------------------------
 local function buildWindow(gui)
+  local saver = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
+    BorderSizePixel = 0, Visible = false, Parent = gui})
+  local saverText = new("TextLabel", {Text = "", Font = F.bold, TextSize = 16, TextColor3 = T.orange,
+    BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.new(1, -40, 0, 140), TextWrapped = true, Parent = saver})
   local W, H = 390, 262
   local win = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
     Size = UDim2.fromOffset(W, H), BackgroundColor3 = T.bg, BorderSizePixel = 0, Parent = gui})
@@ -1451,7 +1643,7 @@ local function buildWindow(gui)
     new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = p})
     new("UIPadding", {PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), Parent = p})
     local b = new("TextButton", {Text = label, Font = F.semi, TextSize = 12, TextColor3 = T.text,
-      BackgroundColor3 = T.card, AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 32), LayoutOrder = tabN, Parent = side})
+      BackgroundColor3 = T.card, AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = tabN, Parent = side})
     corner(b, 8)
     b.MouseButton1Click:Connect(function() selectTab(name) end)
     pages[name], tabs[name] = p, b
@@ -1463,6 +1655,9 @@ local function buildWindow(gui)
     new("TextLabel", {Text = text, Font = F.bold, TextSize = 11, TextColor3 = T.orange, BackgroundTransparency = 1,
       Size = UDim2.new(1, 0, 0, 18), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nxt(), Parent = p})
   end
+
+  local painters = {}
+  local function refreshToggles() for _, f in ipairs(painters) do f(0.2) end end
 
   local function toggle(p, label, desc, key, onChange)
     local h = desc and 46 or 36
@@ -1494,10 +1689,11 @@ local function buildWindow(gui)
       paint(0.2)
       if onChange then onChange(Config[key]) end
     end)
+    painters[#painters + 1] = paint
     paint(0)
   end
 
-  local function slider(p, label, key, min, max, stepV, suffix)
+  local function slider(p, label, key, min, max, stepV, suffix, onChange)
     local card = new("Frame", {BackgroundColor3 = T.card, Size = UDim2.new(1, 0, 0, 50), LayoutOrder = nxt(), Parent = p})
     corner(card, 8)
     new("TextLabel", {Text = label, Font = F.semi, TextSize = 12, TextColor3 = T.text, BackgroundTransparency = 1,
@@ -1526,6 +1722,7 @@ local function buildWindow(gui)
       local v = math.floor((min + a * (max - min)) / stepV + 0.5) * stepV
       Config[key] = math.clamp(v, min, max)
       show()
+      if onChange then onChange(Config[key]) end
     end
     bar.InputBegan:Connect(function(i)
       if isPress(i) then dragging = true p.ScrollingEnabled = false setFrom(i.Position.X) end
@@ -1572,6 +1769,48 @@ local function buildWindow(gui)
       TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card})
   end
 
+  -- página: Início
+  local home = page("home", "🏠  Início")
+  section(home, "PAINEL")
+  local grid = new("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1, LayoutOrder = nxt(), Parent = home})
+  new("UIGridLayout", {CellSize = UDim2.new(0.5, -3, 0, 52), CellPadding = UDim2.fromOffset(6, 6),
+    SortOrder = Enum.SortOrder.LayoutOrder, Parent = grid})
+  local cardN = 0
+  local function dashCard(icon, caption)
+    cardN = cardN + 1
+    local c = new("Frame", {BackgroundColor3 = T.card, LayoutOrder = cardN, Parent = grid})
+    corner(c, 10)
+    local v = new("TextLabel", {Text = "-", Font = F.bold, TextSize = 16, TextColor3 = T.orange,
+      BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -20, 0, 22),
+      TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = c})
+    new("TextLabel", {Text = icon .. "  " .. caption, Font = F.body, TextSize = 10, TextColor3 = T.dim,
+      BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 30), Size = UDim2.new(1, -20, 0, 14),
+      TextXAlignment = Enum.TextXAlignment.Left, Parent = c})
+    return v
+  end
+  local dash = {
+    moon   = dashCard("🌕", "Harvest Moon"),
+    rate   = dashCard("🍬", "Candy por hora"),
+    gain   = dashCard("🎒", "Candy na sessão"),
+    opened = dashCard("🎃", "Abóboras abertas"),
+    jacks  = dashCard("💀", "Jacks"),
+    bosses = dashCard("🏆", "Bosses"),
+  }
+  section(home, "AÇÕES RÁPIDAS")
+  button(home, "▶  Iniciar tudo", function()
+    Config.FarmPumpkins, Config.KillJack, Config.AutoBosses, Config.AutoDoors = true, true, true, true
+    refreshToggles()
+    notify("Tudo ligado", "Abóboras, Jack, bosses e portas", "ok", 3)
+    if Config.AutoMinimize and minimizeFn then task.delay(0.8, minimizeFn) end
+  end, T.green)
+  button(home, "⏸  Parar tudo", function()
+    Config.FarmPumpkins, Config.KillJack, Config.AutoBosses, Config.AutoDoors = false, false, false, false
+    State.active, State.lock = false, nil
+    refreshToggles()
+    notify("Tudo parado", "Personagem liberado", "info", 3)
+  end, T.red)
+
   -- página: Farm
   local farm = page("farm", "🎃  Farm")
   section(farm, "ABÓBORAS")
@@ -1587,6 +1826,7 @@ local function buildWindow(gui)
       end)
     end
   end)
+  toggle(farm, "Rota pelas ilhas", "Sem abóbora aqui, volta onde já viu uma", "PumpkinRoute")
   toggle(farm, "Avisar cada abóbora", nil, "NotifyPumpkins")
   section(farm, "JACK O'LANTERN")
   toggle(farm, "Matar Jack", "Pausa o clique e foca só nele", "KillJack")
@@ -1640,6 +1880,18 @@ local function buildWindow(gui)
   local cfg = page("cfg", "⚙️  Ajustes")
   section(cfg, "INTERFACE")
   toggle(cfg, "Minimizar ao ligar o farm", "Evita o clique cair no menu", "AutoMinimize")
+  toggle(cfg, "Tela preta (economia)", "Para de desenhar o 3D, poupa bateria", "BatterySaver", function() applyPerf() end)
+  toggle(cfg, "Boost de FPS", "Gráfico no mínimo, sem sombra", "BoostFPS", function() applyPerf() end)
+  button(cfg, "💾  Salvar configurações", function()
+    if saveConfig() then notify("Salvo", "Tuas configurações voltam na próxima vez", "ok", 3)
+    elseif not writefile then notify("Sem writefile", "Teu executor não salva arquivos", "warn", 4)
+    else notify("Nada mudou", "Já tava tudo salvo", "info", 2) end
+  end)
+  button(cfg, "♻️  Resetar configurações", function()
+    local ok = delfile and isfile and pcall(function() if isfile(CFG_FILE) then delfile(CFG_FILE) end end)
+    State.noSave = true
+    notify(ok and "Configurações apagadas" or "Não deu pra apagar", "Roda o hub de novo pra voltar ao padrão", ok and "ok" or "warn", 4)
+  end, T.red)
   section(cfg, "MODO DE SOCO")
   local modeBtns = {}
   for i, key in ipairs(MODES) do
@@ -1682,7 +1934,8 @@ local function buildWindow(gui)
     notify("Testando de novo", "Começando por " .. MODE_LABEL[MODES[State.modeIndex]], "info", 3)
   end)
   section(cfg, "MOVIMENTO")
-  slider(cfg, "Velocidade do tween", "TweenSpeed", 150, 350, 10, " st/s")
+  slider(cfg, "Velocidade do tween", "TweenSpeed", 150, 350, 10, " st/s", function(v) State.speed = v end)
+  toggle(cfg, "Tween inteligente", "Se o server puxar, reduz a velocidade sozinho", "SmartTween")
   slider(cfg, "Distância da abóbora", "HitDistance", 2, 6, 0.5, " st")
   section(cfg, "JACK")
   slider(cfg, "Altura no remoto", "JackHeight", 3, 15, 1, " st")
@@ -1708,11 +1961,14 @@ local function buildWindow(gui)
     click  = statRow(st, "Clique"),
     aura   = statRow(st, "Killaura"),
     time   = statRow(st, "Tempo"),
+    speed  = statRow(st, "Velocidade atual"),
+    deaths = statRow(st, "Mortes"),
   }
 
   -- página: Info
   local info = page("info", "📜  Info")
-  para(info, "CLAUDE HUB v" .. VERSION .. "  •  Halloween Edition\nFarm do evento de Halloween do Blox Fruits, feito sob medida pro mobile.")
+  para(info, "CLAUDE HUB v" .. VERSION .. "  •  Halloween Edition\nFarm do evento de Halloween do Blox Fruits, feito sob medida pro mobile.\n"
+    .. "Tuas configurações ficam salvas em " .. CFG_FILE .. " na pasta do executor.")
   section(info, "AVISOS")
   para(info, "• Use em conta alternativa: farm automático pode dar ban.\n"
     .. "• O evento acaba 15/11 às 01:00 UTC (22:00 de 14/11 em Brasília).\n"
@@ -1723,7 +1979,7 @@ local function buildWindow(gui)
   section(info, "CONTROLES")
   para(info, "– minimiza pra abóbora flutuante (arrasta e toca pra abrir).\n× fecha o hub (toca duas vezes).")
 
-  selectTab("farm")
+  selectTab("home")
 
   -- minimizar / fechar
   local fab = new("TextButton", {Text = "🎃", TextSize = 26, Font = F.bold, BackgroundColor3 = T.panel,
@@ -1737,6 +1993,12 @@ local function buildWindow(gui)
     tween(scale, 0.35, {Scale = fit()}, Enum.EasingStyle.Back)
   end
   makeDraggable(fab, fab, restore)
+  local hud = new("TextLabel", {Text = "", Font = F.bold, TextSize = 12, TextColor3 = T.text,
+    BackgroundColor3 = T.panel, BackgroundTransparency = 0.1, AutomaticSize = Enum.AutomaticSize.X,
+    Size = UDim2.fromOffset(0, 28), Position = UDim2.new(1, 8, 0.5, -14), Parent = fab})
+  corner(hud, 14) stroke(hud, T.orange, 1, 0.5)
+  new("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), Parent = hud})
+  table.insert(State.avoid, hud)
   minimizeFn = function()
     if not win.Visible then return end
     tween(scale, 0.25, {Scale = 0})
@@ -1790,6 +2052,25 @@ local function buildWindow(gui)
       er.doors.Text = Doors.scanning and "procurando..." or tostring(#Doors.list)
       er.doorsDone.Text = Doors.done .. " / " .. #Doors.list
       er.gain.Text = "+" .. Event.gain.candy .. " candy • +" .. Event.gain.bits .. " bits"
+      local mA, mL = moonInfo()
+      local moonTxt = mA and ("ATIVA " .. fmt(mL):sub(4)) or fmt(mL):sub(4)
+      local rate = math.floor(Event.gain.candy / math.max(os.clock() - Stats.start, 60) * 3600)
+      dash.moon.Text = moonTxt
+      dash.moon.TextColor3 = mA and T.green or T.orange
+      dash.rate.Text = tostring(rate)
+      dash.gain.Text = "+" .. Event.gain.candy
+      dash.opened.Text = tostring(Stats.opened)
+      dash.jacks.Text = tostring(Stats.jacks)
+      dash.bosses.Text = tostring(Stats.bosses)
+      hud.Text = "🌕 " .. moonTxt .. "   🍬 +" .. Event.gain.candy .. "   🎃 " .. Stats.opened
+      rows.speed.Text = curSpeed() .. " st/s"
+      rows.deaths.Text = tostring(Stats.deaths)
+      saver.Visible = Config.BatterySaver
+      if Config.BatterySaver then
+        saverText.Text = "🎃 CLAUDE HUB farmando\n" .. State.status .. "\n\n🌕 " .. moonTxt .. "   🍬 +"
+          .. Event.gain.candy .. " (" .. rate .. "/h)\n🎃 " .. Stats.opened .. "   💀 " .. Stats.jacks
+          .. "   🏆 " .. Stats.bosses
+      end
       if Event.totalOk then
         er.candy.Text = Event.candy .. " / 5000"
         er.bits.Text = Event.bits .. " / 1000"
@@ -1816,6 +2097,7 @@ local gui = makeGui()
 buildToasts(gui)
 
 local checks = {}
+checks.cfg = loadConfig()
 runLoading(gui, {
   {"Verificando executor...", function() checks.vim = VIM ~= nil end},
   {"Procurando abóboras (PumpkinHunt)...", function()
@@ -1832,7 +2114,9 @@ if State.running then
   startLoops()
   startEventLoop()
   startDoorLoop()
+  applyPerf()
   State.status = "parado"
+  if checks.cfg then notify("Configurações carregadas", "Do jeito que tu deixou da última vez", "info", 4) end
   notify("Bem-vindo, " .. LP.DisplayName .. "!", "Claude Hub v" .. VERSION .. " • Feliz Halloween", "ok", 4)
   if not checks.hunt then notify("Abóboras não achadas", "Chega perto de uma ilha com abóboras", "warn", 5) end
   if not checks.remote then notify("Remote de hit não achado", "O Jack vai ser no clique", "warn", 5) end
