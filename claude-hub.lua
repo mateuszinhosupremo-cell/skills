@@ -14,6 +14,10 @@
   v2.1: pega frutas spawnadas, guarda frutas da mochila, auto Spooky Gacha
   v2.2: visual cinema (abertura com relâmpago, faixas, brasas, borda viva) + sons
   v2.3: só portas de verdade (EventId), escolhe Treat sozinho, captura de giro em qualquer remote
+  v2.4: mata inimigos do evento (vampiro, pirata, esqueleto...), interage com NPC do minigame
+  v2.5: mata tudo que nasce das portas e salas, ESP de frutas/ilhas/players
+  v2.6: Auto Handle Event: responde diálogo, Treat, prompts da sala, pega doces
+  v2.7: chuta os minigames (tarô com memória das cartas) + gravador de minigame
 
   Se o executor não aceitar colar tudo: salva este arquivo na pasta
   "workspace" do executor e roda:  loadstring(readfile("claude_hub.txt"))()
@@ -34,7 +38,7 @@ local SoundService = game:GetService("SoundService")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "2.3"
+local VERSION = "2.7"
 
 local Config = {
   FarmPumpkins   = false,
@@ -48,6 +52,8 @@ local Config = {
   AllowMouse     = false,
   AutoDoors      = false,  -- bate nas portas durante a Harvest Moon
   AutoTreat      = true,   -- depois de bater, escolhe "Treat" (doce na hora, sem minigame)
+  AutoHandle     = true,   -- resolve o evento da porta: diálogo, prompts da sala, doces
+  GuessMinigames = true,   -- chuta os minigames (tarô com memória, perguntas no chute)
   AutoBosses     = true,   -- mata Unbound Werewolf e Hellfire Gas quando aparecem
   SmartTween     = true,   -- se o server puxar de volta, reduz a velocidade sozinho
   PumpkinRoute   = true,   -- sem abóbora por perto, volta onde já viu uma
@@ -60,6 +66,9 @@ local Config = {
   SoundOn        = true,   -- sons da interface
   Volume         = 0.6,
   Cinematic      = true,   -- brasas, borda animada, transições
+  EspFruits      = false,
+  EspIslands     = false,
+  EspPlayers     = false,
   BatterySaver   = false,  -- tela preta: para de desenhar o 3D
   BoostFPS       = false,  -- gráfico no mínimo
   BossKeys       = {"werewolf", "hellfire", "hellrider", "unbound"},
@@ -67,7 +76,7 @@ local Config = {
   BossTimeout    = 600,    -- os dois somem depois de ~10 min
   BossHeight     = 8,      -- altura acima da cabeça do boss
   BossSafePct    = 35,     -- com vida abaixo disso (%), sobe pra recuperar
-  DoorWait       = 2.5,    -- s parado na porta esperando a resposta
+  DoorWait       = 4,      -- s parado na porta esperando a resposta
   DoorNames      = {"halloweendoor", "trickortreat"},
   DoorTextKeys   = {"trick", "treat", "knock", "doce", "porta"},  -- mouse VIM faz o Roblox virar layout de PC no celular   -- minimiza o hub ao ligar o farm (o clique não acerta o menu)
 
@@ -85,6 +94,16 @@ local Config = {
   Cooldown     = 300,
   WaitForJack  = 1.0,
   JackKeys     = {"jack", "lantern"},
+  KillEventMobs  = true,   -- mata vampiro, pirata, esqueleto e cia que aparecem no evento
+  -- salas de trick: Cursed Skeleton, Necromancer (vampiros), Gorilla King, Red/Rip Commander, Yeti...
+  EventMobKeys   = {"skeleton", "esqueleto", "cursed", "vampire", "vampiro", "necromancer", "gorilla",
+                    "commander", "yeti", "snowman", "zombie", "zumbi", "ghost", "fantasma", "soul",
+                    "mummy", "reaper", "death", "suizei", "pirate", "pirata", "oni", "monster", "saw", "beast"},
+  KillAllNear    = false,  -- mata QUALQUER bicho perto, mesmo fora do evento
+  KillAllRadius  = 120,
+  EventMobRadius = 180,    -- só os que estão perto (durante a lua / depois de uma porta)
+  AutoNPC        = true,   -- interage com o NPC do minigame (detetive, etc)
+  NPCKeys        = {"detective", "detetive", "witch", "bruxa", "oni", "shipwright", "ghost"},
   JackRadius   = 400,
   Weapon       = "",
 }
@@ -102,6 +121,8 @@ local State = {
   jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0, avoid = {},
   speed = nil, lastSnap = 0, lastSnapNote = 0, memory = {}, memCount = 0,
   noClick = false, spinArgs = nil, spinN = 0, spinPath = nil, spinMethod = nil,
+  moonActive = false, lastKnock = 0, lastKnockPos = nil, espCleanup = nil,
+  recCapturing = false, recCalls = {},
 }
 local Stats = {opened = 0, jacks = 0, bosses = 0, deaths = 0, start = os.clock()}
 
@@ -585,6 +606,35 @@ local function nameIsJack(n)
   return false
 end
 
+local function nameIsEventMob(n)
+  n = string.lower(n)
+  for _, k in ipairs(Config.EventMobKeys) do
+    if string.find(n, k, 1, true) then return true end
+  end
+  return false
+end
+
+-- um inimigo "do evento" vale a pena quando a lua está ativa, ou logo depois de abrir
+-- uma porta, ou quando está pertinho de mim
+local function eventMobRelevant(p)
+  if not p then return false end
+  if State.lastOpenPos and os.clock() - State.lastOpenTime < 20
+    and (p.Position - State.lastOpenPos).Magnitude < 90 then return true end
+  local root = getRoot()
+  if root and (p.Position - root.Position).Magnitude < Config.EventMobRadius then
+    return State.moonActive or os.clock() - State.lastOpenTime < 30
+  end
+  return false
+end
+
+-- qualquer bicho que nasce até 40s depois de bater numa porta, perto de mim ou da porta
+local function spawnedFromDoor(p)
+  if not (p and os.clock() - State.lastKnock < 40) then return false end
+  local root = getRoot()
+  if root and (p.Position - root.Position).Magnitude < 150 then return true end
+  return State.lastKnockPos ~= nil and (p.Position - State.lastKnockPos).Magnitude < 150
+end
+
 local function watchJack(m)
   task.delay(0.4, function()
     if not (State.running and m.Parent and m:IsA("Model")) then return end
@@ -603,6 +653,10 @@ local function watchJack(m)
     if nameIsJack(m.Name) or nearOpen then
       table.insert(State.jackQueue, m)
       log("Jack detectado: " .. m.Name)
+    elseif Config.KillEventMobs and (spawnedFromDoor(p) or (nameIsEventMob(m.Name) and eventMobRelevant(p))) then
+      table.insert(State.jackQueue, m)
+      log("inimigo do evento: " .. m.Name)
+      notify("Inimigo do evento 👻", m.Name .. " apareceu, indo matar", "warn", 3)
     end
   end)
 end
@@ -672,7 +726,16 @@ local function findJack()
   local enemies = workspace:FindFirstChild("Enemies")
   if enemies then
     for _, m in ipairs(enemies:GetChildren()) do
-      if nameIsJack(m.Name) then consider(m) end
+      if nameIsJack(m.Name) then
+        consider(m)
+      else
+        local p = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+        if Config.KillEventMobs and (spawnedFromDoor(p) or (nameIsEventMob(m.Name) and eventMobRelevant(p))) then
+          consider(m)
+        elseif Config.KillAllNear and p and (p.Position - root.Position).Magnitude < Config.KillAllRadius then
+          consider(m)
+        end
+      end
     end
   end
   return best
@@ -707,7 +770,7 @@ local function killJack(m, kind)
   local t0, lastHp, lastDrop = os.clock(), hum.Health, os.clock()
   local allowed = function()
     if boss then return Config.AutoBosses end
-    return Config.KillJack or kind == "mob"
+    return Config.KillJack or Config.KillEventMobs or Config.KillAllNear or kind == "mob"
   end
   while State.running and State.active and allowed() and alive() and m.Parent and hum.Health > 0 do
     State.jackMode = useClick and "clique" or ("remoto " .. Hit.mode)
@@ -831,6 +894,7 @@ end
 ------------------------------------------------------------------
 local doorStep  -- definido no módulo de portas, mais abaixo
 local fruitStep -- definido no módulo de frutas, mais abaixo
+local npcStep   -- definido junto das portas, mais abaixo
 
 local function step()
   if not alive() then State.active = false State.lock = nil return end
@@ -839,10 +903,11 @@ local function step()
     if b then State.active = true killJack(b, "boss") return end
   end
   if fruitStep and fruitStep() then return end
-  if Config.KillJack then
+  if Config.KillJack or Config.KillEventMobs or Config.KillAllNear then
     local j = findJack()
     if j then State.active = true killJack(j) return end
   end
+  if npcStep and npcStep() then return end
   if doorStep and doorStep() then return end
   if Config.FarmPumpkins then
     local t = nearestPumpkin()
@@ -1149,6 +1214,7 @@ local function startEventLoop()
         Event.warned = false
       end
       Event.moonActive = active
+      State.moonActive = active
       if not active and left <= 60 and not Event.warned then
         Event.warned = true
         notify("Harvest Moon em 1 minuto!", "Portas de doces abrindo", "warn", 6)
@@ -1308,7 +1374,7 @@ local function findTreatButton()
   for _, g in ipairs(pg:GetDescendants()) do
     if (g:IsA("TextButton") or g:IsA("ImageButton")) and not g:FindFirstAncestor("ClaudeHub") then
       local txt = buttonText(g)
-      if txt ~= "" and not txt:find("trick", 1, true) and not txt:find("travessura", 1, true) then
+      if txt ~= "" and txt ~= "trick" and txt ~= "travessura" then
         for _, k in ipairs(TREAT_KEYS) do
           if txt:find(k, 1, true) and guiVisible(g) then return g, txt end
         end
@@ -1335,6 +1401,229 @@ local function chooseTreat()
   return false
 end
 
+-- AUTO HANDLE: depois de bater, responde o diálogo, escolhe Treat, aperta os
+-- prompts da sala e pega os doces (o "Auto Handle Event" dos hubs)
+local Handle = {untilT = 0, baseline = {}, pressed = setmetatable({}, {__mode = "k"}), presses = 0, running = false,
+  memory = {}, matched = {}, guesses = 0, lastGuess = 0}
+
+local GOOD = {
+  {"treat", 100}, {"gostosura", 100}, {"doce", 95}, {"claim", 80}, {"collect", 80}, {"receive", 80},
+  {"receber", 80}, {"pegar", 70}, {"continue", 60}, {"continuar", 60}, {"next", 60}, {"proximo", 60},
+  {"accept", 55}, {"aceitar", 55}, {"okay", 55}, {"ok", 55}, {"sure", 55}, {"yes", 55}, {"sim", 55},
+  {"start", 50}, {"begin", 50}, {"play", 50}, {"jogar", 50}, {"take", 50}, {"thanks", 45}, {"thank", 45},
+  {"fight", 40}, {"lutar", 40},
+}
+local AVOID = {"no", "cancel", "leave", "close", "bye", "nevermind", "decline", "later",
+  "sair", "fechar", "cancelar", "nao", "não", "depois"}
+
+local function wordSet(s)
+  local t = {}
+  for w in s:gmatch("[%w\128-\255]+") do t[w] = true end
+  return t
+end
+
+local function answerScore(txt)
+  if txt == "" then return 0 end
+  local words = wordSet(txt)
+  for _, k in ipairs(AVOID) do
+    if words[k] then return -1 end
+  end
+  local best = 0
+  for _, g in ipairs(GOOD) do
+    local k = g[1]
+    local hit
+    if #k <= 4 then hit = words[k] else hit = txt:find(k, 1, true) end
+    if hit and g[2] > best then best = g[2] end
+  end
+  return best
+end
+
+local function visibleButtons()
+  local out = {}
+  local pg = LP:FindFirstChild("PlayerGui")
+  if not pg then return out end
+  for _, g in ipairs(pg:GetDescendants()) do
+    if (g:IsA("TextButton") or g:IsA("ImageButton")) and not g:FindFirstAncestor("ClaudeHub") and guiVisible(g) then
+      out[#out + 1] = g
+    end
+  end
+  return out
+end
+
+-- só aperta botão que apareceu DEPOIS de bater (o resto é o HUD normal do jogo)
+local guessTick -- definido logo abaixo
+
+local function handleTick()
+  local best, bestS, bestTxt = nil, 0, ""
+  for _, b in ipairs(visibleButtons()) do
+    if not Handle.baseline[b] then
+      local last = Handle.pressed[b]
+      if not (last and os.clock() - last < 1.2) then
+        local txt = buttonText(b)
+        local s = answerScore(txt)
+        if s > bestS then best, bestS, bestTxt = b, s, txt end
+      end
+    end
+  end
+  if best then
+    Handle.pressed[best] = os.clock()
+    if pressGui(best) then
+      Handle.presses = Handle.presses + 1
+      if bestS >= 95 then Doors.treats = Doors.treats + 1 end
+      log("respondi: " .. bestTxt)
+      return true
+    end
+  end
+  if Config.GuessMinigames then return guessTick() end
+  return false
+end
+
+-- CHUTE DE MINIGAME: botões novos que não são diálogo = minigame.
+--   6+ botões parecidos -> tabuleiro do tarô: vira, lembra a cara de cada carta, junta os pares
+--   2 a 5 botões        -> pergunta (ex: quem entrou por último): chuta um
+local NO_GUESS = {"buy", "comprar", "robux", "purchase", "sell", "vender", "trade", "troca", "beli", "$"}
+
+local function guessSafe(txt)
+  for _, k in ipairs(NO_GUESS) do
+    if txt:find(k, 1, true) then return false end
+  end
+  return true
+end
+
+-- "cara" da carta: imagens e textos dentro do botão
+local function faceSig(b)
+  local p = {}
+  if b:IsA("ImageButton") then p[#p + 1] = tostring(b.Image) end
+  for _, d in ipairs(b:GetDescendants()) do
+    if d:IsA("GuiObject") and d.Visible then
+      if d:IsA("ImageLabel") or d:IsA("ImageButton") then p[#p + 1] = tostring(d.Image)
+      elseif d:IsA("TextLabel") then p[#p + 1] = d.Text end
+    end
+  end
+  if b:IsA("TextButton") then p[#p + 1] = b.Text end
+  return table.concat(p, "|")
+end
+
+guessTick = function()
+  if os.clock() - Handle.lastGuess < 0.9 or Handle.guesses >= 60 then return false end
+  local unknown = {}
+  for _, b in ipairs(visibleButtons()) do
+    if not Handle.baseline[b] and not Handle.matched[b] then
+      local txt = buttonText(b)
+      if answerScore(txt) == 0 and guessSafe(txt) then unknown[#unknown + 1] = b end
+    end
+  end
+  if #unknown == 0 then return false end
+  Handle.lastGuess = os.clock()
+  Handle.guesses = Handle.guesses + 1
+  if #unknown >= 6 then
+    -- costas = a cara mais comum entre as cartas
+    local count, sigs = {}, {}
+    for _, b in ipairs(unknown) do
+      local s = faceSig(b)
+      sigs[b] = s
+      count[s] = (count[s] or 0) + 1
+    end
+    local back, bc = nil, 0
+    for s, c in pairs(count) do if c > bc then back, bc = s, c end end
+    for b, s in pairs(sigs) do if s ~= back and s ~= "" then Handle.memory[b] = s end end
+    -- par já conhecido? vira os dois
+    local bySig = {}
+    for b, s in pairs(Handle.memory) do
+      if b.Parent and not Handle.matched[b] and sigs[b] then
+        bySig[s] = bySig[s] or {}
+        table.insert(bySig[s], b)
+      end
+    end
+    for _, list in pairs(bySig) do
+      if #list >= 2 then
+        pressGui(list[1])
+        task.wait(0.35)
+        pressGui(list[2])
+        Handle.matched[list[1]], Handle.matched[list[2]] = true, true
+        log("tarô: par encontrado")
+        return true
+      end
+    end
+    -- senão vira duas que ainda não vi e decora a cara delas
+    local unseen = {}
+    for _, b in ipairs(unknown) do if not Handle.memory[b] then unseen[#unseen + 1] = b end end
+    if #unseen < 2 then unseen = unknown end
+    local i = math.random(#unseen)
+    local j = i
+    while j == i and #unseen > 1 do j = math.random(#unseen) end
+    local a, b = unseen[i], unseen[j]
+    pressGui(a)
+    task.wait(0.4)
+    local sa = faceSig(a)
+    if sa ~= back and sa ~= "" then Handle.memory[a] = sa end
+    if b ~= a then
+      pressGui(b)
+      task.wait(0.4)
+      local sb = faceSig(b)
+      if sb ~= back and sb ~= "" then Handle.memory[b] = sb end
+    end
+    log("tarô: virei duas cartas")
+    return true
+  end
+  local pick = unknown[math.random(#unknown)]
+  pressGui(pick)
+  Handle.presses = Handle.presses + 1
+  log("chutei: " .. (buttonText(pick) ~= "" and buttonText(pick) or pick.Name))
+  return true
+end
+
+local function startHandle(seconds)
+  if not Config.AutoHandle then return end
+  Handle.baseline = {}
+  Handle.memory, Handle.matched = setmetatable({}, {__mode = "k"}), setmetatable({}, {__mode = "k"})
+  Handle.guesses, Handle.lastGuess = 0, 0
+  for _, b in ipairs(visibleButtons()) do Handle.baseline[b] = true end
+  Handle.untilT = os.clock() + seconds
+  if Handle.running then return end
+  Handle.running = true
+  task.spawn(function()
+    while State.running and os.clock() < Handle.untilT do
+      pcall(handleTick)
+      task.wait(0.35)
+    end
+    Handle.running = false
+  end)
+end
+
+local function underDoor(inst)
+  local cur = inst
+  while cur and cur ~= workspace do
+    if cur:GetAttribute("EventId") ~= nil then return true end
+    cur = cur.Parent
+  end
+  return false
+end
+
+-- doces largados no chão perto (bolinha de doce, bowl etc)
+local function collectPickups()
+  local root = getRoot()
+  if not root then return false end
+  for _, o in ipairs(workspace:GetChildren()) do
+    local n = string.lower(o.Name)
+    if (n:find("candy", 1, true) or n:find("doce", 1, true)) and not n:find("concoction", 1, true) then
+      local part = o:IsA("BasePart") and o or o:FindFirstChildWhichIsA("BasePart", true)
+      if part and (part.Position - root.Position).Magnitude < 150 then
+        tweenTo(CFrame.new(part.Position))
+        local r = getRoot()
+        if firetouchinterest and r then
+          pcall(firetouchinterest, r, part, 0)
+          task.wait()
+          pcall(firetouchinterest, r, part, 1)
+        end
+        task.wait(0.3)
+        return true
+      end
+    end
+  end
+  return false
+end
+
 local function doDoor(model)
   Doors.visited[model] = true
   local prompt, pos = doorPos(model)
@@ -1348,6 +1637,9 @@ local function doDoor(model)
   State.lock = cf
   task.wait(0.3)
   local before = Event.gain.candy
+  State.lastKnock, State.lastKnockPos = os.clock(), pos
+  State.lastOpenPos, State.lastOpenTime = pos, os.clock()
+  startHandle(40)
   if prompt then
     if fireproximityprompt then
       pcall(fireproximityprompt, prompt)
@@ -1355,29 +1647,105 @@ local function doDoor(model)
       pcall(function() prompt:InputHoldBegin() task.wait(prompt.HoldDuration + 0.1) prompt:InputHoldEnd() end)
     end
   end
-  chooseTreat()
+  if not Config.AutoHandle then chooseTreat() end
   -- fica parado esperando a resposta (sair de perto cancela a porta)
-  local t0 = os.clock()
+  local t0, inRoom = os.clock(), false
   while os.clock() - t0 < Config.DoorWait and State.running do
     pcall(pollNotifications)
     if Event.gain.candy > before then break end
+    local r = getRoot()
+    if r and (r.Position - stand).Magnitude > 60 then
+      -- o jogo me jogou numa sala: solta a trava pra não brigar com o teleporte
+      inRoom = true
+      State.lock = nil
+      notify("Entrei numa sala 🚪", "Matando o que aparecer", "warn", 3)
+      task.wait(1.5)
+      break
+    end
     task.wait(0.2)
   end
   Doors.done = Doors.done + 1
   local gained = Event.gain.candy - before
   if gained > 0 then notify("Porta: doce!", "+" .. gained .. " Candy Corn", "ok", 2) end
-  -- trick: mata o que nasceu perto da porta
+  -- trick: mata tudo que nasceu perto da porta (ou da sala onde me jogaram)
   local enemies = workspace:FindFirstChild("Enemies")
   if enemies then
-    for _, m in ipairs(enemies:GetChildren()) do
-      local hrp = m:FindFirstChild("HumanoidRootPart")
-      local hum = m:FindFirstChildOfClass("Humanoid")
-      if hrp and hum and hum.Health > 0 and (hrp.Position - pos).Magnitude < 70 then
-        killJack(m, isBossName(m.Name) and "boss" or "mob")
+    for _ = 1, 3 do
+      local any = false
+      local r = getRoot()
+      local center = (inRoom and r) and r.Position or pos
+      for _, m in ipairs(enemies:GetChildren()) do
+        local hrp = m:FindFirstChild("HumanoidRootPart")
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 and (hrp.Position - center).Magnitude < 150 then
+          any = true
+          killJack(m, isBossName(m.Name) and "boss" or "mob")
+        end
       end
+      if not any then break end
+      task.wait(0.5)
+    end
+  end
+  if Config.AutoHandle then
+    for _ = 1, 4 do
+      if not collectPickups() then break end
     end
   end
   State.lock = nil
+end
+
+-- NPCs do minigame: aperta o prompt deles (detetive, bruxa, etc)
+local NPC = {done = setmetatable({}, {__mode = "k"})}
+
+local function npcPrompts()
+  local out = {}
+  local function scan(root)
+    if not root then return end
+    for _, d in ipairs(root:GetDescendants()) do
+      if d:IsA("ProximityPrompt") and d.Enabled then
+        local owner = d:FindFirstAncestorWhichIsA("Model")
+        local nm = string.lower((owner and owner.Name or "") .. " " .. d.ObjectText .. " " .. d.ActionText)
+        local hot = false
+        for _, k in ipairs(Config.NPCKeys) do if nm:find(k, 1, true) then hot = true break end end
+        if hot then out[#out + 1] = {prompt = d, part = d.Parent} end
+      end
+    end
+  end
+  scan(workspace:FindFirstChild("NPCs"))
+  scan(workspace:FindFirstChild("Map"))
+  return out
+end
+
+local function pressPrompt(p)
+  if fireproximityprompt then return pcall(fireproximityprompt, p) end
+  return pcall(function() p:InputHoldBegin() task.wait(p.HoldDuration + 0.1) p:InputHoldEnd() end)
+end
+
+npcStep = function()
+  if not Config.AutoNPC then return false end
+  -- só perto de onde abri uma porta há pouco (é onde o minigame roda)
+  if not (State.lastOpenPos and os.clock() - State.lastOpenTime < 30) then return false end
+  local root = getRoot()
+  if not root then return false end
+  for _, e in ipairs(npcPrompts()) do
+    local part = e.part
+    local pos = part and (part:IsA("Attachment") and part.WorldPosition or part.Position)
+    if pos and not NPC.done[e.prompt] and (pos - State.lastOpenPos).Magnitude < 120 then
+      State.active = true
+      NPC.done[e.prompt] = os.clock()
+      log("falando com NPC do evento")
+      notify("NPC do evento 🕵️", "Interagindo com " .. (part.Parent and part.Parent.Name or "NPC"), "warn", 3)
+      local look = CFrame.lookAt(pos + (root.Position - pos).Unit * 4 + Vector3.new(0, 1, 0), pos)
+      if tweenTo(look) then
+        State.lock = look
+        pressPrompt(e.prompt)
+        task.wait(0.6)
+        State.lock = nil
+      end
+      return true
+    end
+  end
+  return false
 end
 
 doorStep = function()
@@ -1443,6 +1811,22 @@ local function doorDiag()
 end
 
 local function startDoorLoop()
+  local PPS = game:GetService("ProximityPromptService")
+  table.insert(State.conns, PPS.PromptShown:Connect(function(prompt)
+    if not (Config.AutoHandle and os.clock() < Handle.untilT) then return end
+    if underDoor(prompt) or Handle.pressed[prompt] then return end
+    Handle.pressed[prompt] = os.clock()
+    task.delay(0.25, function()
+      if not prompt.Parent then return end
+      if fireproximityprompt then
+        pcall(fireproximityprompt, prompt)
+      else
+        pcall(function() prompt:InputHoldBegin() task.wait(prompt.HoldDuration + 0.1) prompt:InputHoldEnd() end)
+      end
+      Handle.presses = Handle.presses + 1
+      log("interagi: " .. prompt.ActionText)
+    end)
+  end))
   task.spawn(function()
     local wasActive = false
     while State.running do
@@ -1648,11 +2032,13 @@ local function installSpinHook()
   if not (hookmetamethod and getnamecallmethod) then return false end
   local old
   local function h(self, ...)
-    if Spin.capturing then
+    if Spin.capturing or State.recCapturing then
       local m = getnamecallmethod()
       if (m == "InvokeServer" or m == "FireServer") and typeof(self) == "Instance"
         and not (checkcaller and checkcaller()) then
-        Spin.calls[#Spin.calls + 1] = {remote = self, method = m, args = {...}, n = select("#", ...)}
+        local entry = {remote = self, method = m, args = {...}, n = select("#", ...)}
+        if Spin.capturing then Spin.calls[#Spin.calls + 1] = entry end
+        if State.recCapturing and #State.recCalls < 60 then State.recCalls[#State.recCalls + 1] = entry end
       end
     end
     return old(self, ...)
@@ -1764,6 +2150,89 @@ local function trySpin()
   end
 end
 
+-- GRAVADOR DE MINIGAME: registra o que aparece na tela, o que nasce no mapa e
+-- os remotes que o jogo chama, pra eu escrever o resolvedor de verdade
+local Rec = {running = false}
+
+local function shortPath(g)
+  local parts = {}
+  for seg in string.gmatch(g:GetFullName(), "[^%.]+") do parts[#parts + 1] = seg end
+  local from = math.max(1, #parts - 3)
+  return table.concat(parts, ".", from)
+end
+
+local function recordMinigame(seconds)
+  if Rec.running then return end
+  Rec.running = true
+  notify("Gravando minigame 🎥", "Joga normal por " .. seconds .. "s", "warn", 5)
+  local out = {}
+  local function add(s) out[#out + 1] = s end
+  add("v" .. VERSION .. " | gravação de minigame | lua=" .. tostring(State.moonActive))
+  local pg = LP:FindFirstChild("PlayerGui")
+  local base, wsBase = {}, {}
+  if pg then for _, g in ipairs(pg:GetDescendants()) do if g:IsA("GuiObject") then base[g] = true end end end
+  for _, c in ipairs(workspace:GetChildren()) do wsBase[c] = true end
+  State.recCalls = {}
+  State.recCapturing = installSpinHook() and true or false
+  local seen, tracked, lines, t0 = {}, {}, 0, os.clock()
+  while State.running and os.clock() - t0 < seconds do
+    if pg then
+      for _, g in ipairs(pg:GetDescendants()) do
+        if lines > 150 then break end
+        if g:IsA("GuiObject") and not base[g] and not g:FindFirstAncestor("ClaudeHub") and guiVisible(g) then
+          local sig = g.ClassName
+          if g:IsA("TextLabel") or g:IsA("TextButton") or g:IsA("TextBox") then
+            sig = sig .. " '" .. string.sub(plainText(g.Text), 1, 40) .. "'"
+          end
+          if g:IsA("ImageLabel") or g:IsA("ImageButton") then
+            sig = sig .. " img=" .. (tostring(g.Image):match("%d+$") or "-")
+          end
+          if seen[g] ~= sig then
+            seen[g] = sig
+            lines = lines + 1
+            local ap, as = g.AbsolutePosition, g.AbsoluteSize
+            add(string.format("[%.1fs] %s | %s | pos=%d,%d tam=%d,%d", os.clock() - t0, shortPath(g), sig,
+              math.floor(ap.X), math.floor(ap.Y), math.floor(as.X), math.floor(as.Y)))
+          end
+        end
+      end
+    end
+    for _, c in ipairs(workspace:GetChildren()) do
+      if not wsBase[c] and not tracked[c] and (c:IsA("Model") or c:IsA("BasePart")) then
+        tracked[c] = true
+        local okP, pos = pcall(function() return c:IsA("Model") and c:GetPivot().Position or c.Position end)
+        add(string.format("[%.1fs] mapa novo: %s (%s) %s", os.clock() - t0, c.Name, c.ClassName,
+          okP and string.format("%d,%d,%d", math.floor(pos.X), math.floor(pos.Y), math.floor(pos.Z)) or ""))
+      end
+    end
+    task.wait(0.5)
+  end
+  State.recCapturing = false
+  add("--- remotes chamados: " .. #State.recCalls)
+  for i = 1, math.min(25, #State.recCalls) do
+    local c = State.recCalls[i]
+    local okP, path = pcall(function() return c.remote:GetFullName() end)
+    add("  " .. (okP and path or "?") .. ":" .. c.method .. "(" .. argsText(c.args, c.n) .. ")")
+  end
+  local root = getRoot()
+  local en = workspace:FindFirstChild("Enemies")
+  if en and root then
+    local near = {}
+    for _, m in ipairs(en:GetChildren()) do
+      local p = m:FindFirstChild("HumanoidRootPart")
+      if p and (p.Position - root.Position).Magnitude < 200 and #near < 10 then near[#near + 1] = m.Name end
+    end
+    add("inimigos perto: " .. (#near > 0 and table.concat(near, ", ") or "nenhum"))
+  end
+  local text = table.concat(out, "\n")
+  if #text > 14000 then text = string.sub(text, 1, 14000) .. "\n[cortado]" end
+  print("[Claude Hub] gravação de minigame:\n" .. text)
+  local copied = setclipboard and pcall(setclipboard, text)
+  notify(copied and "Gravação copiada 🎥" or "Gravação no console",
+    copied and "Cola aqui no chat pro Claude" or "Abre o console e me manda", "ok", 6)
+  Rec.running = false
+end
+
 local function startFruitLoop()
   table.insert(State.conns, workspace.ChildAdded:Connect(function(o)
     task.delay(0.6, function()
@@ -1795,6 +2264,7 @@ local function Stop()
   State.running, State.active, State.lock, State.noClick = false, false, nil, false
   for _, c in ipairs(State.conns) do pcall(function() c:Disconnect() end) end
   for p, v in pairs(savedCollide) do if p.Parent then p.CanCollide = v end end
+  if State.espCleanup then pcall(State.espCleanup) end
   if State.gui then State.gui:Destroy() end
   if genv.ClaudeHub and genv.ClaudeHub.Stop == Stop then genv.ClaudeHub = nil end
   print("[Claude Hub] fechado")
@@ -2186,6 +2656,159 @@ local function runLoading(gui, steps)
 end
 
 ------------------------------------------------------------------
+-- ESP: frutas, ilhas e players
+------------------------------------------------------------------
+local ESP = {folder = nil, items = {}, islands = {}, lastIslands = 0}
+
+local function espFolder()
+  if ESP.folder and ESP.folder.Parent then return ESP.folder end
+  local f = Instance.new("Folder")
+  f.Name = "ClaudeESP"
+  local ok = gethui and pcall(function() f.Parent = gethui() end)
+  if not ok then ok = pcall(function() f.Parent = game:GetService("CoreGui") end) end
+  if not ok then f.Parent = LP:WaitForChild("PlayerGui") end
+  ESP.folder = f
+  return f
+end
+
+local ESP_COLOR = {fruit = T.orange2, island = Color3.fromRGB(120, 210, 255), player = Color3.fromRGB(255, 90, 90)}
+
+local function espMake(target, adornee, kind, extra)
+  local color = ESP_COLOR[kind]
+  local bb = Instance.new("BillboardGui")
+  bb.Name = "ClaudeESP_" .. kind
+  bb.AlwaysOnTop = true
+  bb.LightInfluence = 0
+  bb.Size = UDim2.fromOffset(170, 36)
+  bb.StudsOffset = Vector3.new(0, kind == "island" and 25 or 3.5, 0)
+  bb.MaxDistance = kind == "island" and 1e6 or 20000
+  bb.Adornee = adornee
+  local l = Instance.new("TextLabel")
+  l.Size = UDim2.fromScale(1, 1)
+  l.BackgroundTransparency = 1
+  l.Font = Enum.Font.GothamBold
+  l.TextSize = kind == "island" and 13 or 12
+  l.TextColor3 = color
+  l.TextStrokeTransparency = 0.25
+  l.TextStrokeColor3 = Color3.new(0, 0, 0)
+  l.Text = ""
+  l.Parent = bb
+  bb.Parent = espFolder()
+  local hl
+  if kind ~= "island" then
+    hl = Instance.new("Highlight")
+    hl.Name = "ClaudeESP_HL"
+    hl.FillColor, hl.OutlineColor = color, color
+    hl.FillTransparency, hl.OutlineTransparency = 0.8, 0
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Adornee = target
+    pcall(function() hl.Parent = target end)
+  end
+  local it = {bb = bb, label = l, hl = hl, kind = kind, adornee = adornee}
+  for k, v in pairs(extra or {}) do it[k] = v end
+  ESP.items[target] = it
+  return it
+end
+
+local function espRemove(target)
+  local it = ESP.items[target]
+  if not it then return end
+  pcall(function() it.bb:Destroy() end)
+  if it.hl then pcall(function() it.hl:Destroy() end) end
+  ESP.items[target] = nil
+end
+
+local function refreshIslands()
+  local out = {}
+  local wo = workspace:FindFirstChild("_WorldOrigin")
+  local locs = wo and wo:FindFirstChild("Locations")
+  if locs then
+    for _, p in ipairs(locs:GetChildren()) do
+      if p:IsA("BasePart") then out[#out + 1] = {key = p, adornee = p, name = p.Name} end
+    end
+  end
+  if #out == 0 then
+    local map = workspace:FindFirstChild("Map")
+    if map then
+      for _, m in ipairs(map:GetChildren()) do
+        local part = m:IsA("BasePart") and m or m:FindFirstChildWhichIsA("BasePart", true)
+        if part then out[#out + 1] = {key = m, adornee = part, name = m.Name} end
+      end
+    end
+  end
+  ESP.islands, ESP.lastIslands = out, os.clock()
+end
+
+local function fmtDist(d)
+  d = math.floor(d)
+  if d >= 1000 then return string.format("%.1fk", d / 1000) end
+  return tostring(d)
+end
+
+local function espTick()
+  local root = getRoot()
+  local want = {}
+  if Config.EspFruits then
+    for _, o in ipairs(workspace:GetChildren()) do
+      if isSpawnedFruit(o) then
+        want[o] = true
+        if not ESP.items[o] then espMake(o, o.Handle, "fruit") end
+      end
+    end
+  end
+  if Config.EspIslands then
+    if os.clock() - ESP.lastIslands > 15 then refreshIslands() end
+    for _, isl in ipairs(ESP.islands) do
+      if isl.key.Parent then
+        want[isl.key] = true
+        if not ESP.items[isl.key] then espMake(isl.key, isl.adornee, "island", {name = isl.name}) end
+      end
+    end
+  end
+  if Config.EspPlayers then
+    for _, plr in ipairs(Players:GetPlayers()) do
+      local ch = plr ~= LP and plr.Character
+      local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+      if hrp then
+        want[ch] = true
+        if not ESP.items[ch] then espMake(ch, hrp, "player", {plr = plr}) end
+      end
+    end
+  end
+  for target, it in pairs(ESP.items) do
+    if not want[target] or not target.Parent or not it.adornee.Parent then
+      espRemove(target)
+    else
+      local d = root and fmtDist((it.adornee.Position - root.Position).Magnitude) or "?"
+      if it.kind == "fruit" then
+        it.label.Text = "🍎 " .. target.Name .. "\n" .. d .. " st"
+      elseif it.kind == "island" then
+        it.label.Text = "🏝️ " .. it.name .. "  •  " .. d
+      else
+        local hum = target:FindFirstChildOfClass("Humanoid")
+        local hp = hum and math.floor(hum.Health / math.max(hum.MaxHealth, 1) * 100) or 0
+        local lvl = ""
+        pcall(function() lvl = " [" .. it.plr.Data.Level.Value .. "]" end)
+        it.label.Text = it.plr.DisplayName .. lvl .. "\n" .. d .. " st  •  " .. hp .. "%"
+      end
+    end
+  end
+end
+
+local function startESP()
+  State.espCleanup = function()
+    for target in pairs(ESP.items) do espRemove(target) end
+    if ESP.folder then pcall(function() ESP.folder:Destroy() end) end
+  end
+  task.spawn(function()
+    while State.running do
+      pcall(espTick)
+      task.wait(0.3)
+    end
+  end)
+end
+
+------------------------------------------------------------------
 -- UI: JANELA PRINCIPAL
 ------------------------------------------------------------------
 local function buildWindow(gui)
@@ -2273,12 +2896,12 @@ local function buildWindow(gui)
     BackgroundColor3 = T.panel, BorderSizePixel = 0, Parent = win})
   corner(side, 10)
   new("UIPadding", {PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = side})
-  new("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = side})
+  new("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = side})
   local content = new("Frame", {Position = UDim2.fromOffset(112, 48), Size = UDim2.new(1, -120, 1, -56),
     BackgroundTransparency = 1, ClipsDescendants = true, Parent = win})
   local sideFx = new("Frame", {Position = UDim2.fromOffset(8, 48), Size = UDim2.new(0, 96, 1, -56),
     BackgroundTransparency = 1, ZIndex = 3, Parent = win})
-  local indicator = new("Frame", {Size = UDim2.fromOffset(3, 18), Position = UDim2.fromOffset(2, 11),
+  local indicator = new("Frame", {Size = UDim2.fromOffset(3, 18), Position = UDim2.fromOffset(2, 9),
     BackgroundColor3 = T.orange, BorderSizePixel = 0, ZIndex = 3, Parent = sideFx})
   corner(indicator, 2)
   new("UIStroke", {Color = T.orange, Thickness = 2, Transparency = 0.6, Parent = indicator})
@@ -2305,7 +2928,7 @@ local function buildWindow(gui)
       tween(b, 0.2, {BackgroundColor3 = on and T.sel or T.card})
       b.TextColor3 = on and T.orange2 or T.text
       if on then
-        tween(indicator, 0.3, {Position = UDim2.fromOffset(2, 6 + (b.LayoutOrder - 1) * 33 + 5)}, Enum.EasingStyle.Back)
+        tween(indicator, 0.3, {Position = UDim2.fromOffset(2, 6 + (b.LayoutOrder - 1) * 28 + 3)}, Enum.EasingStyle.Back)
       end
     end
   end
@@ -2317,7 +2940,7 @@ local function buildWindow(gui)
     new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = p})
     new("UIPadding", {PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), Parent = p})
     local b = new("TextButton", {Text = label, Font = F.semi, TextSize = 12, TextColor3 = T.text,
-      BackgroundColor3 = T.card, AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = tabN, Parent = side})
+      BackgroundColor3 = T.card, AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 24), LayoutOrder = tabN, Parent = side})
     corner(b, 8)
     b.MouseButton1Click:Connect(function() selectTab(name) end)
     pages[name], tabs[name] = p, b
@@ -2516,6 +3139,9 @@ local function buildWindow(gui)
   toggle(farm, "Avisar fruta spawnada", nil, "FruitNotify")
   section(farm, "JACK O'LANTERN")
   toggle(farm, "Matar Jack", "Pausa o clique e foca só nele", "KillJack")
+  toggle(farm, "Matar bichos do evento", "Tudo que nasce das portas e salas", "KillEventMobs")
+  toggle(farm, "Matar qualquer bicho perto", "Killaura em tudo num raio, até fora do evento", "KillAllNear")
+  toggle(farm, "Interagir com NPC", "Detetive e outros do minigame das portas", "AutoNPC")
   toggle(farm, "Killaura remoto", "RegisterHit, sem clique", "JackRemote")
   toggle(farm, "Clique se o remote falhar", "Desce e soca se não der dano", "JackFallback")
   section(farm, "BOSSES DO EVENTO")
@@ -2533,9 +3159,13 @@ local function buildWindow(gui)
   }
   section(ev, "PORTAS (HARVEST MOON)")
   toggle(ev, "Farm de portas", "Só portas de verdade, 1x por lua", "AutoDoors")
-  toggle(ev, "Escolher Treat sozinho", "Doce na hora, pula os minigames", "AutoTreat")
+  toggle(ev, "Auto Handle Event", "Diálogo, Treat, prompts da sala e doces", "AutoHandle")
+  toggle(ev, "Preferir Treat", "Doce na hora, pula os minigames", "AutoTreat")
+  toggle(ev, "Chutar minigames", "Tarô com memória das cartas, perguntas no chute", "GuessMinigames")
+  button(ev, "🎥  Gravar minigame (20s)", function() task.spawn(recordMinigame, 20) end)
   er.doors = statRow(ev, "Portas reais / prontas")
   er.doorsDone = statRow(ev, "Batidas nesta lua")
+  er.handled = statRow(ev, "Respostas automáticas")
   button(ev, "🚪  Diagnóstico de portas", function()
     task.spawn(function()
       if doorDiag() then notify("Diagnóstico copiado", "Cola aqui no chat pro Claude", "ok", 5)
@@ -2571,6 +3201,14 @@ local function buildWindow(gui)
       else notify("Total não achado", "Abre o inventário de materiais e toca de novo", "warn", 4) end
     end)
   end)
+
+  -- página: ESP
+  local espP = page("esp", "👁️  ESP")
+  section(espP, "VER ATRAVÉS DO MAPA")
+  toggle(espP, "Frutas", "Nome e distância das frutas no chão", "EspFruits")
+  toggle(espP, "Ilhas", "Nome e distância de cada ilha", "EspIslands")
+  toggle(espP, "Players", "Nome, nível, distância e vida", "EspPlayers")
+  para(espP, "Frutas aparecem em laranja, ilhas em azul e players em vermelho, com contorno através das paredes.")
 
   -- página: Ajustes
   local cfg = page("cfg", "⚙️  Ajustes")
@@ -2643,6 +3281,7 @@ local function buildWindow(gui)
   section(cfg, "BOSS")
   slider(cfg, "Altura acima do boss", "BossHeight", 3, 25, 1, " st")
   slider(cfg, "Fugir com vida abaixo de", "BossSafePct", 10, 60, 5, "%")
+  slider(cfg, "Raio do 'qualquer bicho'", "KillAllRadius", 40, 300, 10, " st")
   section(cfg, "SPOOKY GACHA")
   slider(cfg, "Tentar girar a cada", "SpinEvery", 60, 1800, 30, "s")
   section(cfg, "CLIQUE HUMANO")
@@ -2758,6 +3397,7 @@ local function buildWindow(gui)
       er.ends.Text = endLeft > 0 and fmt(endLeft) or "acabou"
       er.doors.Text = Doors.scanning and "procurando..." or (#Doors.list .. " / " .. readyCount())
       er.doorsDone.Text = Doors.done .. " / " .. #Doors.list
+      er.handled.Text = Handle.presses .. " (" .. Doors.treats .. " treats)"
       er.spinSaved.Text = Spin.capturing and "capturando..." or (Spin.live and ("sim • " .. Spin.live.remote.Name))
         or (State.spinPath and "sim (salvo)") or "não"
       er.spins.Text = tostring(Spin.spins)
@@ -2828,6 +3468,7 @@ if State.running then
   startEventLoop()
   startDoorLoop()
   startFruitLoop()
+  startESP()
   applyPerf()
   State.status = "parado"
   if checks.cfg then notify("Configurações carregadas", "Do jeito que tu deixou da última vez", "info", 4) end
