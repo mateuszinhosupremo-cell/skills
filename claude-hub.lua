@@ -26,7 +26,7 @@ local VirtualUser  = game:GetService("VirtualUser")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "1.3"
+local VERSION = "1.4"
 
 local Config = {
   FarmPumpkins   = false,
@@ -65,7 +65,7 @@ local MODE_LABEL = {
 local State = {
   running = true, active = false, lock = nil, gui = nil,
   pumpkins = {}, done = setmetatable({}, {__mode = "k"}), jackQueue = {},
-  modeIndex = VIM and 1 or 2, modeConfirmed = false, switches = 0, modeRefresh = nil,
+  modeIndex = 3, modeConfirmed = true, switches = 0, modeRefresh = nil, -- 3 = Remote
   status = "carregando", lastOpenPos = nil, lastOpenTime = 0,
   jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0, avoid = {},
 }
@@ -613,8 +613,9 @@ end
 ------------------------------------------------------------------
 local EVENT_END = 1794704400 -- 15/11/2026 01:00 UTC
 local Event = {
-  candy = nil, bits = nil, seeds = nil, candyStart = nil,
-  invOk = false, lastRead = 0, debugged = false,
+  candy = nil, bits = nil, seeds = nil, totalOk = false, source = nil,
+  gain = {candy = 0, bits = 0, seeds = 0}, seen = setmetatable({}, {__mode = "k"}),
+  lastRead = 0, invName = nil, invProbed = false,
   moonActive = nil, warned = false, capWarned = false, gpWarned = false,
 }
 
@@ -626,12 +627,12 @@ local function fmt(s)
   return string.format("%02d:%02d:%02d", h, m, sec)
 end
 
--- Harvest Moon: XX:00 a XX:10 UTC, toda hora
 local function clockAt(t)
   local d = os.date("*t", t)
   return string.format("%02d:%02d", d.hour, d.min)
 end
 
+-- Harvest Moon: XX:00 a XX:10 UTC, toda hora
 local function moonInfo()
   local t = os.time()
   local into = t % 3600
@@ -639,66 +640,134 @@ local function moonInfo()
   return false, 3600 - into, t - into + 3600
 end
 
-local function itemOf(k, e)
-  if type(e) ~= "table" then return nil, nil end
-  local name = e.Name or e.name or e.ItemName or (type(k) == "string" and k or nil)
-  local n = e.Count or e.count or e.Amount or e.Quantity or e.Value
-  return name, tonumber(n)
+local function plainText(s)
+  s = tostring(s or "")
+  s = s:gsub("<[^>]->", ""):gsub("&lt;", ""):gsub("&gt;", ""):gsub("&amp;", "&")
+  return s
+end
+
+local ITEMS = {candy = "candy corn", bits = "pumpkin bit", seeds = "pumpkin seed"}
+
+-- "Obtained <Candy Corn>", "Obtained 3x <Candy Corn>", "Obtained <Candy Corn> x3"
+local function parseObtained(text, key)
+  local l = string.lower(plainText(text))
+  local a, b = l:find(key, 1, true)
+  if not a then return nil end
+  local before, after = l:sub(1, a - 1), l:sub(b + 1)
+  local n = before:match("(%d+)%s*x?%s*$") or after:match("^s?%s*x%s*(%d+)") or after:match("^s?%s*%((%d+)%)")
+  return tonumber(n) or 1
+end
+
+local function notifText(nobj)
+  local inner = nobj:FindFirstChild("Text")
+  if inner and (inner:IsA("TextLabel") or inner:IsA("TextButton")) then return inner.Text end
+  if nobj:IsA("TextLabel") or nobj:IsA("TextButton") then return nobj.Text end
+  return ""
+end
+
+-- ganho na sessão: lê os avisos "Obtained <Candy Corn>" que o próprio jogo mostra
+local function pollNotifications()
+  local pg = LP:FindFirstChild("PlayerGui")
+  local root = pg and pg:FindFirstChild("Notifications")
+  local stack = root and root:FindFirstChild("NotificationStack")
+  if not stack then return end
+  for _, nobj in ipairs(stack:GetChildren()) do
+    if not Event.seen[nobj] then
+      local txt = notifText(nobj)
+      if txt ~= "" then
+        Event.seen[nobj] = true
+        for field, key in pairs(ITEMS) do
+          local n = parseObtained(txt, key)
+          if n then
+            Event.gain[field] = Event.gain[field] + n
+            if Event.totalOk and Event[field] then Event[field] = Event[field] + n end
+          end
+        end
+      end
+    end
+  end
+end
+
+local INV_NAMES = {"getInventory", "GetInventory", "getInventoryItems", "GetInventoryItems", "getInventoryMaterials"}
+
+local function countIn(inv)
+  local found = {}
+  for k, e in pairs(inv) do
+    if type(e) == "table" then
+      local name = e.Name or e.name or e.ItemName or (type(k) == "string" and k or nil)
+      local n = tonumber(e.Count or e.count or e.Amount or e.Quantity or e.Value)
+      if type(name) == "string" then
+        local l = string.lower(name)
+        for field, key in pairs(ITEMS) do
+          if l:find(key, 1, true) then found[field] = n or 1 end
+        end
+      end
+    end
+  end
+  return found
+end
+
+-- total, jeito 1: a lista de itens pelo CommF_ (testa os nomes conhecidos uma vez)
+local function readFromRemote()
+  local remotes = RS:FindFirstChild("Remotes")
+  local comm = remotes and remotes:FindFirstChild("CommF_")
+  if not comm then return nil end
+  local names = Event.invName and {Event.invName} or (Event.invProbed and {} or INV_NAMES)
+  Event.invProbed = true
+  for _, name in ipairs(names) do
+    local ok, inv = pcall(function() return comm:InvokeServer(name) end)
+    if ok and type(inv) == "table" and next(inv) ~= nil then
+      Event.invName = name
+      return countIn(inv)
+    end
+  end
+  return nil
+end
+
+local function numberIn(container, skip)
+  for _, c in ipairs(container:GetDescendants()) do
+    if c ~= skip and (c:IsA("TextLabel") or c:IsA("TextButton")) then
+      local t = plainText(c.Text):gsub("%s", "")
+      local n = t:match("^[xX]?(%d+)$") or t:match("^(%d+)/%d+$")
+      if n then return tonumber(n) end
+    end
+  end
+  return nil
+end
+
+-- total, jeito 2: o cartão do item na tela do inventário (nome + quantidade)
+local function readFromGui()
+  local pg = LP:FindFirstChild("PlayerGui")
+  if not pg then return nil end
+  local found = {}
+  for _, g in ipairs(pg:GetDescendants()) do
+    if (g:IsA("TextLabel") or g:IsA("TextButton")) and not g:FindFirstAncestor("Notifications")
+      and not g:FindFirstAncestor("ClaudeHub") then
+      local l = string.lower(plainText(g.Text)):gsub("^%s+", ""):gsub("%s+$", "")
+      for field, key in pairs(ITEMS) do
+        if not found[field] and (l == key or l == key .. "s" or l == "cursed " .. key or l == "cursed " .. key .. "s") then
+          local n = g.Parent and numberIn(g.Parent, g)
+          if n then found[field] = n end
+        end
+      end
+    end
+  end
+  return next(found) and found or nil
 end
 
 local function readEvent()
-  local remotes = RS:FindFirstChild("Remotes")
-  local comm = remotes and remotes:FindFirstChild("CommF_")
-  local found, okInv = {}, false
-  if comm then
-    local ok, inv = pcall(function() return comm:InvokeServer("getInventory") end)
-    if ok and type(inv) == "table" then
-      okInv = true
-      for k, e in pairs(inv) do
-        local name, n = itemOf(k, e)
-        if type(name) == "string" then
-          local l = string.lower(name):gsub("[%s_%-]", "")
-          if l:find("candycorn", 1, true) then found.candy = n or 1
-          elseif l:find("pumpkinbit", 1, true) then found.bits = n or 1
-          elseif l:find("pumpkinseed", 1, true) then found.seeds = n or 1 end
-        end
-      end
-      if not Event.debugged then
-        Event.debugged = true
-        local _, first = next(inv)
-        if type(first) == "table" then
-          local keys = {}
-          for key in pairs(first) do keys[#keys + 1] = tostring(key) end
-          print("[Claude Hub] inventario: campos = " .. table.concat(keys, ", "))
-        end
-      end
-    end
+  local found, source = readFromRemote(), nil
+  if found then source = "remote " .. tostring(Event.invName) end
+  if not found then
+    found = readFromGui()
+    source = found and "tela do inventário" or nil
   end
-  if not found.candy then
-    local ok, attrs = pcall(function() return LP:GetAttributes() end)
-    if ok then
-      for k, v in pairs(attrs) do
-        local l = string.lower(k):gsub("[%s_%-]", "")
-        if type(v) == "number" and (l:find("candycorn", 1, true) or l == "candy") then found.candy = v end
-      end
-    end
-  end
-  if not found.candy then
-    local data = LP:FindFirstChild("Data")
-    if data then
-      for _, v in ipairs(data:GetDescendants()) do
-        local l = string.lower(v.Name):gsub("[%s_%-]", "")
-        if v:IsA("ValueBase") and (l:find("candycorn", 1, true) or l == "candy") then found.candy = tonumber(v.Value) end
-      end
-    end
-  end
-  Event.invOk = okInv or found.candy ~= nil
-  if not Event.invOk then return false end
-  Event.candy = found.candy or 0
-  Event.bits = found.bits or 0
-  Event.seeds = found.seeds or 0
   Event.lastRead = os.clock()
-  if Event.candyStart == nil then Event.candyStart = Event.candy end
+  if not found then return false end
+  Event.totalOk, Event.source = true, source
+  Event.candy = found.candy or Event.candy or 0
+  Event.bits = found.bits or Event.bits or 0
+  Event.seeds = found.seeds or Event.seeds or 0
   if Event.candy >= 5000 and not Event.capWarned then
     Event.capWarned = true
     notify("Candy Corn no limite!", "5000 de 5000: gasta no Spooky Gacha", "warn", 6)
@@ -710,74 +779,57 @@ local function readEvent()
   return true
 end
 
-local function shallow(t)
-  local p = {}
-  for k, v in pairs(t) do
-    if #p >= 10 then p[#p + 1] = "..." break end
-    p[#p + 1] = tostring(k) .. "=" .. (type(v) == "table" and "{tabela}" or tostring(v))
-  end
-  return "{" .. table.concat(p, ", ") .. "}"
-end
-
 local function candyDiag()
   local out = {}
   local function add(s) out[#out + 1] = tostring(s) end
-  local function hot(s)
-    s = string.lower(tostring(s)):gsub("[%s_%-]", "")
-    return s:find("candy", 1, true) or s:find("pumpkin", 1, true) or s:find("corn", 1, true)
-  end
   local remotes = RS:FindFirstChild("Remotes")
   local comm = remotes and remotes:FindFirstChild("CommF_")
-  add("CommF_: " .. tostring(comm ~= nil))
+  add("v" .. VERSION .. " | CommF_: " .. tostring(comm ~= nil))
   if comm then
-    local ok, inv = pcall(function() return comm:InvokeServer("getInventory") end)
-    add("getInventory ok=" .. tostring(ok) .. " tipo=" .. typeof(inv))
-    if ok and type(inv) == "table" then
-      local n, shown = 0, 0
-      for k, e in pairs(inv) do
-        n = n + 1
-        local line = tostring(k) .. " -> " .. (type(e) == "table" and shallow(e) or tostring(e))
-        if n <= 3 then add("  item " .. n .. ": " .. line)
-        elseif hot(line) and shown < 12 then shown = shown + 1 add("  achado: " .. line) end
-      end
-      add("  total de itens: " .. n)
-    elseif not ok then
-      add("  erro: " .. tostring(inv))
+    for _, name in ipairs(INV_NAMES) do
+      local ok, inv = pcall(function() return comm:InvokeServer(name) end)
+      local n = 0
+      if ok and type(inv) == "table" then for _ in pairs(inv) do n = n + 1 end end
+      add(name .. ": ok=" .. tostring(ok) .. " tipo=" .. typeof(inv) .. " itens=" .. n)
     end
   end
-  local okA, attrs = pcall(function() return LP:GetAttributes() end)
-  if okA then
-    local a = {}
-    for k, v in pairs(attrs) do a[#a + 1] = k .. "=" .. tostring(v) end
-    add("atributos do player: " .. (#a > 0 and table.concat(a, ", ") or "nenhum"))
-  end
-  local data = LP:FindFirstChild("Data")
-  if data then
-    local d = {}
-    for _, v in ipairs(data:GetChildren()) do
-      if #d >= 40 then d[#d + 1] = "..." break end
-      d[#d + 1] = v.Name .. (v:IsA("ValueBase") and ("=" .. tostring(v.Value)) or "")
-    end
-    add("Data: " .. table.concat(d, ", "))
-  else
-    add("Data: nao existe")
-  end
+  add("ganho na sessão (avisos): candy=" .. Event.gain.candy .. " bits=" .. Event.gain.bits .. " sementes=" .. Event.gain.seeds)
+  add("total: " .. (Event.totalOk and (tostring(Event.candy) .. " via " .. tostring(Event.source)) or "não achado"))
   local pg = LP:FindFirstChild("PlayerGui")
+  local root = pg and pg:FindFirstChild("Notifications")
+  local stack = root and root:FindFirstChild("NotificationStack")
+  if stack then
+    for _, nobj in ipairs(stack:GetChildren()) do
+      local txt = notifText(nobj)
+      if txt ~= "" then add("aviso completo: " .. string.sub(plainText(txt), 1, 120)) break end
+    end
+  end
   if pg then
     local c = 0
     for _, g in ipairs(pg:GetDescendants()) do
-      if (g:IsA("TextLabel") or g:IsA("TextButton")) and hot(g.Text) and c < 12 then
-        c = c + 1
-        add("tela: " .. g:GetFullName() .. " = " .. string.sub(g.Text, 1, 60))
+      if c >= 8 then break end
+      if (g:IsA("TextLabel") or g:IsA("TextButton")) and not g:FindFirstAncestor("Notifications")
+        and not g:FindFirstAncestor("ClaudeHub") then
+        local l = string.lower(plainText(g.Text))
+        if l:find("candy corn", 1, true) or l:find("pumpkin bit", 1, true) or l:find("pumpkin seed", 1, true) then
+          c = c + 1
+          local sib = {}
+          if g.Parent then
+            for _, s in ipairs(g.Parent:GetDescendants()) do
+              if s ~= g and (s:IsA("TextLabel") or s:IsA("TextButton")) and s.Text ~= "" and #sib < 6 then
+                sib[#sib + 1] = s.Name .. "='" .. string.sub(plainText(s.Text), 1, 25) .. "'"
+              end
+            end
+          end
+          add("tela: " .. g:GetFullName() .. " = '" .. string.sub(plainText(g.Text), 1, 40) .. "' | vizinhos: " .. table.concat(sib, ", "))
+        end
       end
     end
-    add("textos de doce na tela: " .. c)
+    add("cartões de item achados: " .. c .. (c == 0 and " (abre o inventário de materiais e roda de novo)" or ""))
   end
   local text = table.concat(out, "\n")
-  if #text > 8000 then text = string.sub(text, 1, 8000) .. "\n[cortado]" end
   print("[Claude Hub] diagnostico de doces:\n" .. text)
-  local copied = setclipboard and pcall(setclipboard, text)
-  return copied
+  return setclipboard and pcall(setclipboard, text)
 end
 
 local function startEventLoop()
@@ -797,11 +849,12 @@ local function startEventLoop()
         Event.warned = true
         notify("Harvest Moon em 1 minuto!", "Portas de doces abrindo", "warn", 6)
       end
+      pcall(pollNotifications)
       if os.clock() - Event.lastRead > 20 then
         Event.lastRead = os.clock()
         task.spawn(readEvent)
       end
-      task.wait(1)
+      task.wait(0.5)
     end
   end)
 end
@@ -1277,8 +1330,8 @@ local function buildWindow(gui)
   end)
   button(ev, "🔄  Atualizar doces agora", function()
     task.spawn(function()
-      if readEvent() then notify("Doces atualizados", "Candy Corn: " .. tostring(Event.candy), "ok", 2)
-      else notify("Não consegui ler os doces", "Inventário não respondeu", "err", 4) end
+      if readEvent() then notify("Doces atualizados", "Candy Corn: " .. tostring(Event.candy) .. " (" .. tostring(Event.source) .. ")", "ok", 3)
+      else notify("Total não achado", "Abre o inventário de materiais e toca de novo", "warn", 4) end
     end)
   end)
 
@@ -1360,7 +1413,7 @@ local function buildWindow(gui)
     .. "• O evento acaba 15/11 às 01:00 UTC (22:00 de 14/11 em Brasília).\n"
     .. "• Soco não registra ou a tela vira PC? Ajustes → Modo de soco.\n"
     .. "• Killaura sem dano? Me manda o console.\n"
-    .. "• Doces aparecendo errado? Me manda a linha 'inventario: campos' do console.")
+    .. "• Doces errados? Evento → Diagnóstico de doces e me manda.")
   section(info, "CONTROLES")
   para(info, "– minimiza pra abóbora flutuante (arrasta e toca pra abrir).\n× fecha o hub (toca duas vezes).")
 
@@ -1427,16 +1480,20 @@ local function buildWindow(gui)
       end
       local endLeft = EVENT_END - os.time()
       er.ends.Text = endLeft > 0 and fmt(endLeft) or "acabou"
-      if Event.invOk then
+      er.gain.Text = "+" .. Event.gain.candy .. " candy • +" .. Event.gain.bits .. " bits"
+      if Event.totalOk then
         er.candy.Text = Event.candy .. " / 5000"
-        er.gain.Text = "+" .. math.max(0, Event.candy - (Event.candyStart or Event.candy))
         er.bits.Text = Event.bits .. " / 1000"
         er.seeds.Text = tostring(Event.seeds)
         er.rolls.Text = math.floor(Event.candy / 500) .. " (500 cada, 2/h)"
         er.gp.Text = (Event.bits >= 200 and Event.seeds >= 3) and "pronta pra invocar!"
-          or (math.min(Event.bits, 200) .. "/200 bits • " .. math.min(Event.seeds, 3) .. "/3 sementes")
+          or (math.min(Event.bits, 200) .. "/200 bits • " .. math.min(Event.seeds, 3) .. "/3 sem.")
       else
-        er.candy.Text = "lendo..."
+        er.candy.Text = "? (abre o inventário)"
+        er.bits.Text = "+" .. Event.gain.bits .. " na sessão"
+        er.seeds.Text = "+" .. Event.gain.seeds .. " na sessão"
+        er.rolls.Text = "precisa do total"
+        er.gp.Text = "precisa do total"
       end
       task.wait(0.5)
     end
@@ -1470,7 +1527,7 @@ if State.running then
   if not checks.hunt then notify("Abóboras não achadas", "Chega perto de uma ilha com abóboras", "warn", 5) end
   if not checks.remote then notify("Remote de hit não achado", "O Jack vai ser no clique", "warn", 5) end
   if not checks.vim then notify("Sem VirtualInputManager", "O soco vai usar Activate/Remote", "warn", 5) end
-  if not checks.inv then notify("Doces não lidos", "Tento de novo a cada 20s", "warn", 5) end
+  if not checks.inv then notify("Total de doces não achado", "O ganho da sessão já conta pelos avisos do jogo", "info", 6) end
   local active, left = moonInfo()
   task.delay(2.4, function()
     notify(active and "Harvest Moon ATIVA 🌕" or "Próxima Harvest Moon",
