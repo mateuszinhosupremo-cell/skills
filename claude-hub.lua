@@ -13,6 +13,7 @@
         rota de abóboras pelas ilhas, mini HUD, modo economia/FPS
   v2.1: pega frutas spawnadas, guarda frutas da mochila, auto Spooky Gacha
   v2.2: visual cinema (abertura com relâmpago, faixas, brasas, borda viva) + sons
+  v2.3: só portas de verdade (EventId), escolhe Treat sozinho, captura de giro em qualquer remote
 
   Se o executor não aceitar colar tudo: salva este arquivo na pasta
   "workspace" do executor e roda:  loadstring(readfile("claude_hub.txt"))()
@@ -33,7 +34,7 @@ local SoundService = game:GetService("SoundService")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "2.2"
+local VERSION = "2.3"
 
 local Config = {
   FarmPumpkins   = false,
@@ -46,6 +47,7 @@ local Config = {
   AutoMode       = true,   -- testa outro modo de soco se o atual não registrar
   AllowMouse     = false,
   AutoDoors      = false,  -- bate nas portas durante a Harvest Moon
+  AutoTreat      = true,   -- depois de bater, escolhe "Treat" (doce na hora, sem minigame)
   AutoBosses     = true,   -- mata Unbound Werewolf e Hellfire Gas quando aparecem
   SmartTween     = true,   -- se o server puxar de volta, reduz a velocidade sozinho
   PumpkinRoute   = true,   -- sem abóbora por perto, volta onde já viu uma
@@ -66,7 +68,7 @@ local Config = {
   BossHeight     = 8,      -- altura acima da cabeça do boss
   BossSafePct    = 35,     -- com vida abaixo disso (%), sobe pra recuperar
   DoorWait       = 2.5,    -- s parado na porta esperando a resposta
-  DoorNames      = {"halloweendoor"},
+  DoorNames      = {"halloweendoor", "trickortreat"},
   DoorTextKeys   = {"trick", "treat", "knock", "doce", "porta"},  -- mouse VIM faz o Roblox virar layout de PC no celular   -- minimiza o hub ao ligar o farm (o clique não acerta o menu)
 
   TweenSpeed   = 250,   -- acima disso o server te puxa de volta
@@ -99,7 +101,7 @@ local State = {
   status = "carregando", lastOpenPos = nil, lastOpenTime = 0,
   jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0, avoid = {},
   speed = nil, lastSnap = 0, lastSnapNote = 0, memory = {}, memCount = 0,
-  noClick = false, spinArgs = nil, spinN = 0,
+  noClick = false, spinArgs = nil, spinN = 0, spinPath = nil, spinMethod = nil,
 }
 local Stats = {opened = 0, jacks = 0, bosses = 0, deaths = 0, start = os.clock()}
 
@@ -122,7 +124,9 @@ local function saveable()
     if type(v) == "boolean" or type(v) == "number" then t[k] = v end
   end
   t._mode, t._modeOk = State.modeIndex, State.modeConfirmed
-  if State.spinArgs then t._spin, t._spinN = State.spinArgs, State.spinN end
+  if State.spinPath and State.spinArgs then
+    t._spin, t._spinN, t._spinPath, t._spinMethod = State.spinArgs, State.spinN, State.spinPath, State.spinMethod
+  end
   return t
 end
 
@@ -148,8 +152,9 @@ local function loadConfig()
   end
   if type(data._mode) == "number" and MODES[data._mode] then State.modeIndex = data._mode end
   if type(data._modeOk) == "boolean" then State.modeConfirmed = data._modeOk end
-  if type(data._spin) == "table" and #data._spin > 0 then
+  if type(data._spinPath) == "string" and type(data._spin) == "table" then
     State.spinArgs, State.spinN = data._spin, tonumber(data._spinN) or #data._spin
+    State.spinPath, State.spinMethod = data._spinPath, data._spinMethod
   end
   return true
 end
@@ -1161,7 +1166,10 @@ end
 ------------------------------------------------------------------
 -- PORTAS (Harvest Moon)
 ------------------------------------------------------------------
-local Doors = {list = {}, visited = setmetatable({}, {__mode = "k"}), hour = -1, done = 0, scanning = false, lastScan = 0}
+-- porta de verdade: tem o atributo EventId e a peça "Proximity" com o prompt "Interact".
+-- as do hotel da Tartaruga sem isso são só enfeite e ficam de fora.
+local Doors = {list = {}, visited = setmetatable({}, {__mode = "k"}), hour = -1, done = 0,
+  scanning = false, lastScan = 0, treats = 0}
 
 local function isDoorName(n)
   n = string.lower(n):gsub("[%s_%-]", "")
@@ -1171,14 +1179,29 @@ local function isDoorName(n)
   return false
 end
 
-local function doorInteract(model)
-  local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
-  if prompt then return "prompt", prompt end
-  local cd = model:FindFirstChildWhichIsA("ClickDetector", true)
-  if cd then return "click", cd end
-  local touch = model:FindFirstChildWhichIsA("TouchTransmitter", true)
-  if touch then return "touch", touch.Parent end
-  return nil, nil
+local function doorPrompt(model)
+  local prox = model:FindFirstChild("Proximity")
+  local p = prox and prox:FindFirstChildOfClass("ProximityPrompt")
+  return p or model:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+local function isRealDoor(model)
+  if model:GetAttribute("EventId") ~= nil then return true end
+  return model:FindFirstChild("Proximity") ~= nil and doorPrompt(model) ~= nil
+end
+
+local function serverNow()
+  local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
+  return ok and t or os.time()
+end
+
+-- pronta pra bater: prompt ligado e sem cooldown
+local function doorReady(model)
+  local p = doorPrompt(model)
+  if not (p and p.Enabled) then return false end
+  local cd = model:GetAttribute("CooldownUntil")
+  if type(cd) == "number" and cd > serverNow() then return false end
+  return true
 end
 
 local function scanDoors()
@@ -1188,18 +1211,9 @@ local function scanDoors()
   local map = workspace:FindFirstChild("Map") or workspace
   for i, d in ipairs(map:GetDescendants()) do
     if i % 4000 == 0 then task.wait() end
-    if d:IsA("Model") and isDoorName(d.Name) and not seen[d] then
+    if d:IsA("Model") and not seen[d] and (d:GetAttribute("EventId") ~= nil or isDoorName(d.Name)) and isRealDoor(d) then
       seen[d] = true
       out[#out + 1] = d
-    elseif d:IsA("ProximityPrompt") then
-      local txt = string.lower(d.ActionText .. " " .. d.ObjectText)
-      for _, k in ipairs(Config.DoorTextKeys) do
-        if txt:find(k, 1, true) then
-          local m = d:FindFirstAncestor("HalloweenDoor") or d:FindFirstAncestorWhichIsA("Model")
-          if m and not seen[m] then seen[m] = true out[#out + 1] = m end
-          break
-        end
-      end
     end
   end
   Doors.list = out
@@ -1208,12 +1222,11 @@ local function scanDoors()
 end
 
 local function doorPos(model)
-  local kind, h = doorInteract(model)
-  local part = h
-  if kind == "prompt" or kind == "click" then part = h.Parent end
-  if part and part:IsA("Attachment") then return kind, h, part.WorldPosition end
-  if part and part:IsA("BasePart") then return kind, h, part.Position end
-  return kind, h, model:GetPivot().Position
+  local p = doorPrompt(model)
+  local part = p and p.Parent
+  if part and part:IsA("Attachment") then return p, part.WorldPosition end
+  if part and part:IsA("BasePart") then return p, part.Position end
+  return p, model:GetPivot().Position
 end
 
 local function nearestDoor()
@@ -1221,7 +1234,7 @@ local function nearestDoor()
   if not root then return nil end
   local best, bd = nil, math.huge
   for _, m in ipairs(Doors.list) do
-    if m.Parent and not Doors.visited[m] then
+    if m.Parent and not Doors.visited[m] and doorReady(m) then
       local d = (m:GetPivot().Position - root.Position).Magnitude
       if d < bd then best, bd = m, d end
     end
@@ -1229,9 +1242,102 @@ local function nearestDoor()
   return best
 end
 
+local function readyCount()
+  local n = 0
+  for _, m in ipairs(Doors.list) do
+    if m.Parent and doorReady(m) and not Doors.visited[m] then n = n + 1 end
+  end
+  return n
+end
+
+-- botões da tela: acha e aperta (Treat/Doce) sem precisar tocar
+local function guiVisible(g)
+  local cur = g
+  while cur do
+    if cur:IsA("ScreenGui") then return cur.Enabled end
+    if cur:IsA("GuiObject") and not cur.Visible then return false end
+    cur = cur.Parent
+  end
+  return false
+end
+
+local function buttonText(b)
+  local txt = b:IsA("TextButton") and b.Text or ""
+  if txt == "" then
+    local l = b:FindFirstChildWhichIsA("TextLabel", true)
+    txt = l and l.Text or ""
+  end
+  return string.lower(plainText(txt))
+end
+
+local function pressGui(btn)
+  if getconnections then
+    for _, sig in ipairs({btn.MouseButton1Click, btn.Activated, btn.MouseButton1Down}) do
+      local ok, conns = pcall(getconnections, sig)
+      local fired = false
+      if ok and type(conns) == "table" then
+        for _, c in ipairs(conns) do
+          local okFire = pcall(function()
+            if c.Fire then c:Fire() elseif c.Function then c.Function() end
+          end)
+          fired = fired or okFire
+        end
+      end
+      if fired then return true end
+    end
+  end
+  if firesignal and pcall(firesignal, btn.MouseButton1Click) then return true end
+  if VIM then
+    local sg = btn:FindFirstAncestorOfClass("ScreenGui")
+    local inset = (sg and not sg.IgnoreGuiInset) and game:GetService("GuiService"):GetGuiInset().Y or 0
+    local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+    local x, y = p.X + s.X / 2, p.Y + s.Y / 2 + inset
+    return pcall(function()
+      VIM:SendTouchEvent(8, 0, x, y)
+      task.wait(0.05)
+      VIM:SendTouchEvent(8, 2, x, y)
+    end)
+  end
+  return false
+end
+
+local TREAT_KEYS = {"treat", "gostosura", "doce"}
+local function findTreatButton()
+  local pg = LP:FindFirstChild("PlayerGui")
+  if not pg then return nil end
+  for _, g in ipairs(pg:GetDescendants()) do
+    if (g:IsA("TextButton") or g:IsA("ImageButton")) and not g:FindFirstAncestor("ClaudeHub") then
+      local txt = buttonText(g)
+      if txt ~= "" and not txt:find("trick", 1, true) and not txt:find("travessura", 1, true) then
+        for _, k in ipairs(TREAT_KEYS) do
+          if txt:find(k, 1, true) and guiVisible(g) then return g, txt end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- depois de bater: escolhe "Treat" (doce na hora, sem minigame)
+local function chooseTreat()
+  if not Config.AutoTreat then return false end
+  local t0 = os.clock()
+  while os.clock() - t0 < 3 and State.running do
+    local btn, txt = findTreatButton()
+    if btn then
+      local ok = pressGui(btn)
+      log("escolhi: " .. txt)
+      if ok then Doors.treats = Doors.treats + 1 end
+      return ok
+    end
+    task.wait(0.15)
+  end
+  return false
+end
+
 local function doDoor(model)
   Doors.visited[model] = true
-  local kind, h, pos = doorPos(model)
+  local prompt, pos = doorPos(model)
   local look = model:GetPivot().LookVector
   local flat = Vector3.new(look.X, 0, look.Z)
   flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(1, 0, 0)
@@ -1242,31 +1348,19 @@ local function doDoor(model)
   State.lock = cf
   task.wait(0.3)
   local before = Event.gain.candy
-  if kind == "prompt" then
+  if prompt then
     if fireproximityprompt then
-      pcall(fireproximityprompt, h)
+      pcall(fireproximityprompt, prompt)
     else
-      pcall(function() h:InputHoldBegin() task.wait(h.HoldDuration + 0.1) h:InputHoldEnd() end)
-    end
-  elseif kind == "click" then
-    if fireclickdetector then pcall(fireclickdetector, h) end
-  elseif kind == "touch" then
-    local root = getRoot()
-    if firetouchinterest and root then
-      pcall(firetouchinterest, root, h, 0)
-      task.wait()
-      pcall(firetouchinterest, root, h, 1)
-    end
-  else
-    for _ = 1, 4 do
-      pcall(click, model, model:FindFirstChildWhichIsA("BasePart", true))
-      humanPause()
+      pcall(function() prompt:InputHoldBegin() task.wait(prompt.HoldDuration + 0.1) prompt:InputHoldEnd() end)
     end
   end
+  chooseTreat()
   -- fica parado esperando a resposta (sair de perto cancela a porta)
   local t0 = os.clock()
   while os.clock() - t0 < Config.DoorWait and State.running do
     pcall(pollNotifications)
+    if Event.gain.candy > before then break end
     task.wait(0.2)
   end
   Doors.done = Doors.done + 1
@@ -1306,8 +1400,9 @@ local function doorDiag()
   if #Doors.list == 0 then scanDoors() end
   local out = {}
   local function add(s) out[#out + 1] = tostring(s) end
-  local active, left = moonInfo()
-  add("v" .. VERSION .. " | lua " .. (active and "ATIVA" or "fora") .. " | portas achadas: " .. #Doors.list)
+  local active = moonInfo()
+  add("v" .. VERSION .. " | lua " .. (active and "ATIVA" or "fora") .. " | portas reais: " .. #Doors.list
+    .. " | prontas: " .. readyCount() .. " | agora: " .. math.floor(serverNow()))
   local root = getRoot()
   local best, bd = nil, math.huge
   if root then
@@ -1317,25 +1412,31 @@ local function doorDiag()
     end
   end
   if best then
-    local base = best:GetFullName()
-    add("mais perto: " .. base .. " (" .. math.floor(bd) .. " studs)")
+    local p = doorPrompt(best)
+    add("mais perto: " .. best:GetFullName() .. " (" .. math.floor(bd) .. " studs) pronta=" .. tostring(doorReady(best)))
     local ok, attrs = pcall(function() return best:GetAttributes() end)
     if ok then for k, v in pairs(attrs) do add("  @" .. k .. " = " .. tostring(v)) end end
-    local n = 0
-    for _, d in ipairs(best:GetDescendants()) do
-      n = n + 1
-      if n > 40 then add("  ...") break end
-      local extra = ""
-      if d:IsA("ProximityPrompt") then
-        extra = " action='" .. d.ActionText .. "' object='" .. d.ObjectText .. "' hold=" .. d.HoldDuration
-          .. " dist=" .. d.MaxActivationDistance .. " on=" .. tostring(d.Enabled)
-      elseif d:IsA("ClickDetector") then
-        extra = " dist=" .. d.MaxActivationDistance
+    if p then add("  prompt action='" .. p.ActionText .. "' on=" .. tostring(p.Enabled) .. " dist=" .. p.MaxActivationDistance) end
+  end
+  for i = 1, math.min(10, #Doors.list) do
+    local m = Doors.list[i]
+    add("porta " .. i .. ": " .. m:GetFullName() .. " pronta=" .. tostring(doorReady(m)))
+  end
+  -- o que tá na tela agora (bata numa porta e rode isso com a escolha aberta)
+  local pg = LP:FindFirstChild("PlayerGui")
+  if pg then
+    local c = 0
+    for _, g in ipairs(pg:GetDescendants()) do
+      if c >= 15 then break end
+      if (g:IsA("TextButton") or g:IsA("ImageButton")) and not g:FindFirstAncestor("ClaudeHub") and guiVisible(g) then
+        local txt = buttonText(g)
+        if txt ~= "" then
+          c = c + 1
+          add("botão: " .. g:GetFullName() .. " = '" .. string.sub(txt, 1, 30) .. "'")
+        end
       end
-      add("  " .. d.ClassName .. " " .. string.sub(d:GetFullName(), #base + 2) .. extra)
     end
   end
-  for i = 1, math.min(8, #Doors.list) do add("porta " .. i .. ": " .. Doors.list[i]:GetFullName()) end
   local text = table.concat(out, "\n")
   print("[Claude Hub] diagnostico de portas:\n" .. text)
   return setclipboard and pcall(setclipboard, text)
@@ -1350,7 +1451,7 @@ local function startDoorLoop()
       if (active and not wasActive) or (stale and (Config.AutoDoors or active)) or Doors.lastScan == 0 then
         pcall(scanDoors)
         if active and not wasActive and Config.AutoDoors then
-          notify("Farm de portas", #Doors.list .. " portas pra bater nesta lua", "ok", 4)
+          notify("Farm de portas", readyCount() .. " portas prontas nesta lua", "ok", 4)
         end
       end
       wasActive = active
@@ -1512,47 +1613,74 @@ end
 ------------------------------------------------------------------
 -- SPOOKY GACHA (500 Candy = 1 giro)
 ------------------------------------------------------------------
-local Spin = {capturing = false, hooked = false, calls = {}, lastTry = 0, spins = 0}
+-- captura QUALQUER remote que o jogo chamar quando tu gira na mão
+-- (o giro não usa o CommF_, por isso a captura antiga não pegava)
+local Spin = {capturing = false, hooked = false, calls = {}, lastTry = 0, spins = 0, live = nil}
+local SPIN_WORDS = {"gacha", "spooky", "halloween", "cousin", "roll", "spin", "zioles", "haunted"}
 
-local function isSpinWord(args, n)
-  for i = 1, n do
-    if type(args[i]) == "string" then
-      local l = string.lower(args[i])
-      for _, k in ipairs({"gacha", "spooky", "halloween", "cousin", "roll", "spin", "zioles"}) do
-        if l:find(k, 1, true) then return true end
-      end
-    end
+local function hasSpinWord(s)
+  s = string.lower(tostring(s))
+  for _, k in ipairs(SPIN_WORDS) do
+    if s:find(k, 1, true) then return true end
   end
   return false
 end
 
 local function argsText(args, n)
   local p = {}
-  for i = 1, n do p[i] = type(args[i]) == "string" and string.format("%q", args[i]) or tostring(args[i]) end
+  for i = 1, math.min(n, 6) do
+    local v = args[i]
+    p[i] = type(v) == "string" and string.format("%q", v) or (typeof(v) == "Instance" and v:GetFullName() or tostring(v))
+  end
   return table.concat(p, ", ")
+end
+
+local function resolvePath(path)
+  local cur = game
+  for part in string.gmatch(path, "[^%.]+") do
+    cur = cur and cur:FindFirstChild(part)
+  end
+  return cur
 end
 
 local function installSpinHook()
   if Spin.hooked then return true end
   if not (hookmetamethod and getnamecallmethod) then return false end
-  local remote = commF()
-  if not remote then return false end
   local old
   local function h(self, ...)
-    if Spin.capturing and rawequal(self, remote) and getnamecallmethod() == "InvokeServer"
-      and not (checkcaller and checkcaller()) then
-      local n, args, simple = select("#", ...), {...}, true
-      for i = 1, n do
-        local t = type(args[i])
-        if t ~= "string" and t ~= "number" and t ~= "boolean" then simple = false end
+    if Spin.capturing then
+      local m = getnamecallmethod()
+      if (m == "InvokeServer" or m == "FireServer") and typeof(self) == "Instance"
+        and not (checkcaller and checkcaller()) then
+        Spin.calls[#Spin.calls + 1] = {remote = self, method = m, args = {...}, n = select("#", ...)}
       end
-      if simple then Spin.calls[#Spin.calls + 1] = {args = args, n = n} end
     end
     return old(self, ...)
   end
   old = hookmetamethod(game, "__namecall", newcclosure and newcclosure(h) or h)
   Spin.hooked = true
   return true
+end
+
+local function pickSpinCall(calls)
+  local count = {}
+  for _, c in ipairs(calls) do count[c.remote] = (count[c.remote] or 0) + 1 end
+  local best, bestScore = nil, -math.huge
+  for i, c in ipairs(calls) do
+    local okP, path = pcall(function() return c.remote:GetFullName() end)
+    c.path = okP and path or "?"
+    local s = 0
+    if hasSpinWord(c.path) then s = s + 5 end
+    for k = 1, c.n do
+      if type(c.args[k]) == "string" and hasSpinWord(c.args[k]) then s = s + 3 end
+    end
+    if count[c.remote] > 4 then s = s - 4 end -- remote que dispara toda hora não é o giro
+    if count[c.remote] == 1 then s = s + 1 end
+    s = s + i * 0.001 -- empate: o mais recente
+    c.score = s
+    if s > bestScore then best, bestScore = c, s end
+  end
+  return best, bestScore
 end
 
 local function captureSpin()
@@ -1562,37 +1690,69 @@ local function captureSpin()
     return
   end
   Spin.calls, Spin.capturing = {}, true
-  notify("Capturando o giro", "Vai no Zioles e gira o Spooky 1x na mão (30s)", "warn", 8)
+  notify("Capturando o giro 🎯", "Gira o Spooky 1x na mão agora (25s)", "warn", 8)
   local t0 = os.clock()
-  while State.running and os.clock() - t0 < 30 do
+  while State.running and os.clock() - t0 < 25 do
     task.wait(0.25)
-    local found = false
-    for _, c in ipairs(Spin.calls) do if isSpinWord(c.args, c.n) then found = true end end
-    if found then task.wait(1.5) break end
+    local hit = false
+    for _, c in ipairs(Spin.calls) do
+      local okP, path = pcall(function() return c.remote:GetFullName() end)
+      if (okP and hasSpinWord(path)) then hit = true end
+      for k = 1, c.n do if type(c.args[k]) == "string" and hasSpinWord(c.args[k]) then hit = true end end
+    end
+    if hit then task.wait(1.5) break end
   end
   Spin.capturing = false
-  local pick
-  for _, c in ipairs(Spin.calls) do if isSpinWord(c.args, c.n) then pick = c end end
-  pick = pick or Spin.calls[#Spin.calls]
-  if not pick then
-    notify("Nada capturado", "Tenta de novo girando dentro dos 30s", "err", 5)
+  if #Spin.calls == 0 then
+    notify("Nada capturado", "Gira dentro dos 25s depois de tocar no botão", "err", 6)
     return
   end
-  State.spinArgs, State.spinN = pick.args, pick.n
-  pcall(saveConfig)
-  log("giro capturado: " .. argsText(pick.args, pick.n))
-  notify("Giro capturado ✅", argsText(pick.args, pick.n), "ok", 8)
+  local pick, score = pickSpinCall(Spin.calls)
+  print("[Claude Hub] chamadas capturadas: " .. #Spin.calls)
+  table.sort(Spin.calls, function(a, b) return (a.score or 0) > (b.score or 0) end)
+  for i = 1, math.min(6, #Spin.calls) do
+    local c = Spin.calls[i]
+    print(string.format("  %.2f  %s:%s(%s)", c.score or 0, c.path or "?", c.method, argsText(c.args, c.n)))
+  end
+  if not pick or score < 1 then
+    notify("Não reconheci o giro", "Me manda o console (lista das chamadas)", "warn", 7)
+    return
+  end
+  Spin.live = pick
+  local simple = true
+  for k = 1, pick.n do
+    local t = type(pick.args[k])
+    if t ~= "string" and t ~= "number" and t ~= "boolean" then simple = false end
+  end
+  if simple then
+    State.spinPath, State.spinMethod, State.spinArgs, State.spinN = pick.path, pick.method, pick.args, pick.n
+    pcall(saveConfig)
+  end
+  log("giro capturado: " .. pick.path .. ":" .. pick.method .. "(" .. argsText(pick.args, pick.n) .. ")")
+  notify("Giro capturado ✅", pick.remote.Name .. (simple and " • salvo" or " • vale até fechar o hub"), "ok", 7)
+end
+
+local function spinReady()
+  return Spin.live ~= nil or (State.spinPath ~= nil and State.spinArgs ~= nil)
 end
 
 local function trySpin()
-  if not (Config.AutoSpin and State.spinArgs) then return end
+  if not (Config.AutoSpin and spinReady()) then return end
   if Event.totalOk and Event.candy and Event.candy < 500 then return end
   if os.clock() - Spin.lastTry < Config.SpinEvery then return end
-  local remote = commF()
+  local remote, method, args, n
+  if Spin.live and Spin.live.remote.Parent then
+    remote, method, args, n = Spin.live.remote, Spin.live.method, Spin.live.args, Spin.live.n
+  else
+    remote, method, args, n = resolvePath(State.spinPath or ""), State.spinMethod, State.spinArgs, State.spinN
+  end
   if not remote then return end
   Spin.lastTry = os.clock()
   local t0 = os.clock()
-  pcall(function() remote:InvokeServer((table.unpack or unpack)(State.spinArgs, 1, State.spinN or #State.spinArgs)) end)
+  local unpackF = table.unpack or unpack
+  pcall(function()
+    if method == "FireServer" then remote:FireServer(unpackF(args, 1, n)) else remote:InvokeServer(unpackF(args, 1, n)) end
+  end)
   task.wait(3)
   pcall(pollNotifications)
   if Event.otherTime and Event.otherTime >= t0 then
@@ -1600,7 +1760,7 @@ local function trySpin()
     if Event.totalOk and Event.candy then Event.candy = math.max(0, Event.candy - 500) end
     notify("Spooky Gacha 🎰", Event.otherText, "win", 6)
   else
-    log("giro sem resultado (cooldown de 2/h ou longe do Zioles)")
+    log("giro sem resultado (limite de 2/h, candy ou longe do Zioles)")
   end
 end
 
@@ -2372,8 +2532,9 @@ local function buildWindow(gui)
     ends    = statRow(ev, "Evento acaba em"),
   }
   section(ev, "PORTAS (HARVEST MOON)")
-  toggle(ev, "Farm de portas", "1x por porta a cada lua, mata o trick", "AutoDoors")
-  er.doors = statRow(ev, "Portas achadas")
+  toggle(ev, "Farm de portas", "Só portas de verdade, 1x por lua", "AutoDoors")
+  toggle(ev, "Escolher Treat sozinho", "Doce na hora, pula os minigames", "AutoTreat")
+  er.doors = statRow(ev, "Portas reais / prontas")
   er.doorsDone = statRow(ev, "Batidas nesta lua")
   button(ev, "🚪  Diagnóstico de portas", function()
     task.spawn(function()
@@ -2383,13 +2544,13 @@ local function buildWindow(gui)
   end)
   section(ev, "SPOOKY GACHA")
   toggle(ev, "Girar sozinho", "500 Candy = 1 giro (o jogo deixa 2 por hora)", "AutoSpin", function(on)
-    if on and not State.spinArgs then
+    if on and not spinReady() then
       notify("Falta capturar o giro", "Toca em 'Capturar giro' e gira 1x na mão", "warn", 6)
     end
   end)
   er.spinSaved = statRow(ev, "Giro capturado")
   er.spins = statRow(ev, "Giros feitos")
-  button(ev, "🎯  Capturar giro (gira 1x na mão)", function() task.spawn(captureSpin) end)
+  button(ev, "🎯  Capturar giro (toca e gira 1x na mão)", function() task.spawn(captureSpin) end)
   section(ev, "DOCES")
   er.candy  = statRow(ev, "Candy Corn")
   er.gain   = statRow(ev, "Ganho na sessão")
@@ -2595,9 +2756,10 @@ local function buildWindow(gui)
       end
       local endLeft = EVENT_END - os.time()
       er.ends.Text = endLeft > 0 and fmt(endLeft) or "acabou"
-      er.doors.Text = Doors.scanning and "procurando..." or tostring(#Doors.list)
+      er.doors.Text = Doors.scanning and "procurando..." or (#Doors.list .. " / " .. readyCount())
       er.doorsDone.Text = Doors.done .. " / " .. #Doors.list
-      er.spinSaved.Text = State.spinArgs and "sim" or (Spin.capturing and "capturando..." or "não")
+      er.spinSaved.Text = Spin.capturing and "capturando..." or (Spin.live and ("sim • " .. Spin.live.remote.Name))
+        or (State.spinPath and "sim (salvo)") or "não"
       er.spins.Text = tostring(Spin.spins)
       er.gain.Text = "+" .. Event.gain.candy .. " candy • +" .. Event.gain.bits .. " bits"
       local mA, mL = moonInfo()
