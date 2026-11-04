@@ -11,6 +11,8 @@
   - tela de carregamento, avisos, abas, sliders, minimizar
   v2.0: painel inicial, configurações salvas, tween anti-puxão,
         rota de abóboras pelas ilhas, mini HUD, modo economia/FPS
+  v2.1: pega frutas spawnadas, guarda frutas da mochila, auto Spooky Gacha
+  v2.2: visual cinema (abertura com relâmpago, faixas, brasas, borda viva) + sons
 
   Se o executor não aceitar colar tudo: salva este arquivo na pasta
   "workspace" do executor e roda:  loadstring(readfile("claude_hub.txt"))()
@@ -27,10 +29,11 @@ local RS           = game:GetService("ReplicatedStorage")
 local VirtualUser  = game:GetService("VirtualUser")
 local HttpService  = game:GetService("HttpService")
 local Lighting     = game:GetService("Lighting")
+local SoundService = game:GetService("SoundService")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "2.0"
+local VERSION = "2.2"
 
 local Config = {
   FarmPumpkins   = false,
@@ -47,6 +50,14 @@ local Config = {
   SmartTween     = true,   -- se o server puxar de volta, reduz a velocidade sozinho
   PumpkinRoute   = true,   -- sem abóbora por perto, volta onde já viu uma
   RouteWait      = 1.5,    -- s esperando a área carregar na rota
+  AutoFruits     = true,   -- vai pegar fruta que spawnar (prioridade) e volta pro farm
+  AutoStore      = true,   -- guarda sozinho as frutas da mochila
+  FruitNotify    = true,   -- avisa quando uma fruta spawna
+  AutoSpin       = false,  -- gira o Spooky Gacha com 500 Candy
+  SpinEvery      = 300,    -- s entre tentativas (o jogo limita 2 giros/h)
+  SoundOn        = true,   -- sons da interface
+  Volume         = 0.6,
+  Cinematic      = true,   -- brasas, borda animada, transições
   BatterySaver   = false,  -- tela preta: para de desenhar o 3D
   BoostFPS       = false,  -- gráfico no mínimo
   BossKeys       = {"werewolf", "hellfire", "hellrider", "unbound"},
@@ -88,6 +99,7 @@ local State = {
   status = "carregando", lastOpenPos = nil, lastOpenTime = 0,
   jackMode = nil, conns = {}, huntHooked = nil, lastErr = 0, avoid = {},
   speed = nil, lastSnap = 0, lastSnapNote = 0, memory = {}, memCount = 0,
+  noClick = false, spinArgs = nil, spinN = 0,
 }
 local Stats = {opened = 0, jacks = 0, bosses = 0, deaths = 0, start = os.clock()}
 
@@ -110,6 +122,7 @@ local function saveable()
     if type(v) == "boolean" or type(v) == "number" then t[k] = v end
   end
   t._mode, t._modeOk = State.modeIndex, State.modeConfirmed
+  if State.spinArgs then t._spin, t._spinN = State.spinArgs, State.spinN end
   return t
 end
 
@@ -135,6 +148,9 @@ local function loadConfig()
   end
   if type(data._mode) == "number" and MODES[data._mode] then State.modeIndex = data._mode end
   if type(data._modeOk) == "boolean" then State.modeConfirmed = data._modeOk end
+  if type(data._spin) == "table" and #data._spin > 0 then
+    State.spinArgs, State.spinN = data._spin, tonumber(data._spinN) or #data._spin
+  end
   return true
 end
 
@@ -266,6 +282,7 @@ local function getMelee()
 end
 
 local function equip()
+  if State.noClick then return getMelee() end
   local tool, hum = getMelee(), getHum()
   if tool and hum and tool.Parent ~= getChar() then
     hum:EquipTool(tool)
@@ -312,6 +329,7 @@ end
 
 -- target/part: o alvo atual (usado só no modo Remote)
 local function click(target, part)
+  if State.noClick then return end
   local mode = MODES[State.modeIndex]
   local tool = equip()
   local cam = workspace.CurrentCamera
@@ -741,7 +759,7 @@ local function killJack(m, kind)
   if hum.Health <= 0 and boss then
     Stats.bosses = Stats.bosses + 1
     log(m.Name .. " derrotado")
-    notify("Boss derrotado! 🏆", m.Name .. " caiu", "ok", 6)
+    notify("Boss derrotado!", m.Name .. " caiu", "win", 6)
   elseif hum.Health <= 0 and kind ~= "mob" then
     Stats.jacks = Stats.jacks + 1
     log("Jack derrotado")
@@ -806,7 +824,8 @@ end
 ------------------------------------------------------------------
 -- LOOPS
 ------------------------------------------------------------------
-local doorStep -- definido no módulo de portas, mais abaixo
+local doorStep  -- definido no módulo de portas, mais abaixo
+local fruitStep -- definido no módulo de frutas, mais abaixo
 
 local function step()
   if not alive() then State.active = false State.lock = nil return end
@@ -814,6 +833,7 @@ local function step()
     local b = findBoss()
     if b then State.active = true killJack(b, "boss") return end
   end
+  if fruitStep and fruitStep() then return end
   if Config.KillJack then
     local j = findJack()
     if j then State.active = true killJack(j) return end
@@ -889,6 +909,7 @@ local Event = {
   gain = {candy = 0, bits = 0, seeds = 0}, seen = setmetatable({}, {__mode = "k"}),
   lastRead = 0, invName = nil, invProbed = false,
   moonActive = nil, warned = false, capWarned = false, gpWarned = false,
+  otherText = "", otherTime = nil,
 }
 
 local function fmt(s)
@@ -948,12 +969,18 @@ local function pollNotifications()
       local txt = notifText(nobj)
       if txt ~= "" then
         Event.seen[nobj] = true
+        local matched = false
         for field, key in pairs(ITEMS) do
           local n = parseObtained(txt, key)
           if n then
+            matched = true
             Event.gain[field] = Event.gain[field] + n
             if Event.totalOk and Event[field] then Event[field] = Event[field] + n end
           end
+        end
+        if not matched then
+          local plain = plainText(txt)
+          if string.lower(plain):find("obtained", 1, true) then Event.otherText, Event.otherTime = plain, os.clock() end
         end
       end
     end
@@ -1332,11 +1359,280 @@ local function startDoorLoop()
   end)
 end
 
+------------------------------------------------------------------
+-- FRUTAS: pegar as que spawnam + guardar as da mochila
+------------------------------------------------------------------
+local Fruits = {
+  pickFailed = setmetatable({}, {__mode = "k"}), storeFailed = setmetatable({}, {__mode = "k"}),
+  announced = setmetatable({}, {__mode = "k"}), picked = 0, stored = 0,
+}
+
+local function commF()
+  local remotes = RS:FindFirstChild("Remotes")
+  return remotes and remotes:FindFirstChild("CommF_")
+end
+
+-- fruta no chão: filho direto do workspace com Handle e "Fruit" no nome ou dentro
+local function isSpawnedFruit(o)
+  if o.Parent ~= workspace or not (o:IsA("Tool") or o:IsA("Model")) then return false end
+  local h = o:FindFirstChild("Handle")
+  if not (h and h:IsA("BasePart")) then return false end
+  return string.lower(o.Name):find("fruit", 1, true) ~= nil or o:FindFirstChild("Fruit") ~= nil
+end
+
+-- fruta física na mochila (não confunde com o poder que tu já comeu)
+local function isPhysicalFruit(t)
+  return t:IsA("Tool") and (t:FindFirstChild("Fruit") ~= nil or t.Name:find("Fruit$") ~= nil)
+end
+
+local function storeName(tool)
+  local attr = tool:GetAttribute("OriginalName")
+  if type(attr) == "string" and attr ~= "" then return attr end
+  local word = string.split(tool.Name, " ")[1]
+  return word .. "-" .. word
+end
+
+local function inMyHands(t)
+  local bp = LP:FindFirstChild("Backpack")
+  return t.Parent ~= nil and (t.Parent == getChar() or t.Parent == bp)
+end
+
+local function storeFruit(tool)
+  local last = Fruits.storeFailed[tool]
+  if last and os.clock() - last < 90 then return false end
+  local comm = commF()
+  if not comm then return false end
+  State.noClick = true
+  local ok = pcall(function()
+    -- 1ª tentativa direto da mochila; se não sair, segura a fruta e tenta de novo
+    comm:InvokeServer("StoreFruit", storeName(tool), tool)
+    task.wait(0.4)
+    if inMyHands(tool) then
+      local hum = getHum()
+      if hum and tool.Parent ~= getChar() then hum:EquipTool(tool) task.wait(0.25) end
+      comm:InvokeServer("StoreFruit", storeName(tool), tool)
+      task.wait(0.4)
+    end
+  end)
+  local stored = ok and not inMyHands(tool)
+  if inMyHands(tool) and tool.Parent == getChar() then
+    local hum = getHum()
+    if hum then hum:UnequipTools() end
+  end
+  State.noClick = false
+  if stored then
+    Fruits.stored = Fruits.stored + 1
+    notify("Fruta guardada 🍎", tool.Name, "ok", 3)
+    return true
+  end
+  Fruits.storeFailed[tool] = os.clock()
+  notify("Não guardou " .. tool.Name, "Repetida ou estoque cheio", "warn", 4)
+  return false
+end
+
+local function storeAll()
+  if not Config.AutoStore or State.noClick then return end
+  local boxes = {}
+  if getChar() then boxes[#boxes + 1] = getChar() end
+  if LP:FindFirstChild("Backpack") then boxes[#boxes + 1] = LP.Backpack end
+  for _, box in ipairs(boxes) do
+    for _, t in ipairs(box:GetChildren()) do
+      if isPhysicalFruit(t) then storeFruit(t) end
+    end
+  end
+end
+
+local function findFruit()
+  local root = getRoot()
+  if not root then return nil end
+  local best, bd = nil, math.huge
+  for _, o in ipairs(workspace:GetChildren()) do
+    if isSpawnedFruit(o) then
+      local last = Fruits.pickFailed[o]
+      if not (last and os.clock() - last < 60) then
+        local d = (o.Handle.Position - root.Position).Magnitude
+        if d < bd then best, bd = o, d end
+      end
+    end
+  end
+  return best
+end
+
+local function collectFruit(f)
+  local handle = f:FindFirstChild("Handle")
+  local root = getRoot()
+  if not (handle and root) then return end
+  local back = root.Position
+  State.noClick = true -- com fruta na mão, um clique comeria ela
+  notify("Fruta: " .. f.Name, "Indo pegar (" .. math.floor((handle.Position - back).Magnitude) .. " studs)", "warn", 4)
+  log("indo pegar " .. f.Name)
+  local arrived = tweenTo(CFrame.new(handle.Position + Vector3.new(0, 2, 0)))
+  if arrived and f.Parent == workspace then
+    State.lock = function() return handle.Parent and CFrame.new(handle.Position) or nil end
+    local r = getRoot()
+    if firetouchinterest and r then
+      pcall(firetouchinterest, r, handle, 0)
+      task.wait()
+      pcall(firetouchinterest, r, handle, 1)
+    end
+    local t0 = os.clock()
+    while f.Parent == workspace and os.clock() - t0 < 3 do task.wait(0.1) end
+    State.lock = nil
+  end
+  local mine = inMyHands(f)
+  if mine and f.Parent == getChar() then
+    local hum = getHum()
+    if hum then hum:UnequipTools() end
+  end
+  State.noClick = false
+  if mine then
+    Fruits.picked = Fruits.picked + 1
+    notify("Fruta pega! 🍎", f.Name, "win", 4)
+    if Config.AutoStore then task.wait(0.3) storeFruit(f) end
+  elseif f.Parent == workspace then
+    Fruits.pickFailed[f] = os.clock()
+    notify("Não peguei a fruta", "Tento de novo em 1 minuto", "warn", 3)
+  end
+  -- volta pro lugar do farm
+  if (Config.FarmPumpkins or Config.AutoDoors) and alive() then
+    log("voltando pro farm")
+    tweenTo(CFrame.new(back))
+  end
+end
+
+fruitStep = function()
+  if not Config.AutoFruits then return false end
+  local f = findFruit()
+  if not f then return false end
+  State.active = true
+  collectFruit(f)
+  return true
+end
+
+------------------------------------------------------------------
+-- SPOOKY GACHA (500 Candy = 1 giro)
+------------------------------------------------------------------
+local Spin = {capturing = false, hooked = false, calls = {}, lastTry = 0, spins = 0}
+
+local function isSpinWord(args, n)
+  for i = 1, n do
+    if type(args[i]) == "string" then
+      local l = string.lower(args[i])
+      for _, k in ipairs({"gacha", "spooky", "halloween", "cousin", "roll", "spin", "zioles"}) do
+        if l:find(k, 1, true) then return true end
+      end
+    end
+  end
+  return false
+end
+
+local function argsText(args, n)
+  local p = {}
+  for i = 1, n do p[i] = type(args[i]) == "string" and string.format("%q", args[i]) or tostring(args[i]) end
+  return table.concat(p, ", ")
+end
+
+local function installSpinHook()
+  if Spin.hooked then return true end
+  if not (hookmetamethod and getnamecallmethod) then return false end
+  local remote = commF()
+  if not remote then return false end
+  local old
+  local function h(self, ...)
+    if Spin.capturing and rawequal(self, remote) and getnamecallmethod() == "InvokeServer"
+      and not (checkcaller and checkcaller()) then
+      local n, args, simple = select("#", ...), {...}, true
+      for i = 1, n do
+        local t = type(args[i])
+        if t ~= "string" and t ~= "number" and t ~= "boolean" then simple = false end
+      end
+      if simple then Spin.calls[#Spin.calls + 1] = {args = args, n = n} end
+    end
+    return old(self, ...)
+  end
+  old = hookmetamethod(game, "__namecall", newcclosure and newcclosure(h) or h)
+  Spin.hooked = true
+  return true
+end
+
+local function captureSpin()
+  if Spin.capturing then return end
+  if not installSpinHook() then
+    notify("Não dá pra capturar", "Teu executor não tem hookmetamethod", "err", 5)
+    return
+  end
+  Spin.calls, Spin.capturing = {}, true
+  notify("Capturando o giro", "Vai no Zioles e gira o Spooky 1x na mão (30s)", "warn", 8)
+  local t0 = os.clock()
+  while State.running and os.clock() - t0 < 30 do
+    task.wait(0.25)
+    local found = false
+    for _, c in ipairs(Spin.calls) do if isSpinWord(c.args, c.n) then found = true end end
+    if found then task.wait(1.5) break end
+  end
+  Spin.capturing = false
+  local pick
+  for _, c in ipairs(Spin.calls) do if isSpinWord(c.args, c.n) then pick = c end end
+  pick = pick or Spin.calls[#Spin.calls]
+  if not pick then
+    notify("Nada capturado", "Tenta de novo girando dentro dos 30s", "err", 5)
+    return
+  end
+  State.spinArgs, State.spinN = pick.args, pick.n
+  pcall(saveConfig)
+  log("giro capturado: " .. argsText(pick.args, pick.n))
+  notify("Giro capturado ✅", argsText(pick.args, pick.n), "ok", 8)
+end
+
+local function trySpin()
+  if not (Config.AutoSpin and State.spinArgs) then return end
+  if Event.totalOk and Event.candy and Event.candy < 500 then return end
+  if os.clock() - Spin.lastTry < Config.SpinEvery then return end
+  local remote = commF()
+  if not remote then return end
+  Spin.lastTry = os.clock()
+  local t0 = os.clock()
+  pcall(function() remote:InvokeServer((table.unpack or unpack)(State.spinArgs, 1, State.spinN or #State.spinArgs)) end)
+  task.wait(3)
+  pcall(pollNotifications)
+  if Event.otherTime and Event.otherTime >= t0 then
+    Spin.spins = Spin.spins + 1
+    if Event.totalOk and Event.candy then Event.candy = math.max(0, Event.candy - 500) end
+    notify("Spooky Gacha 🎰", Event.otherText, "win", 6)
+  else
+    log("giro sem resultado (cooldown de 2/h ou longe do Zioles)")
+  end
+end
+
+local function startFruitLoop()
+  table.insert(State.conns, workspace.ChildAdded:Connect(function(o)
+    task.delay(0.6, function()
+      if not (State.running and Config.FruitNotify and isSpawnedFruit(o)) or Fruits.announced[o] then return end
+      Fruits.announced[o] = true
+      local root = getRoot()
+      local d = root and math.floor((o.Handle.Position - root.Position).Magnitude) or 0
+      notify("🍎 Fruta spawnou!", o.Name .. " a " .. d .. " studs" .. (Config.AutoFruits and " • indo pegar" or ""), "warn", 6)
+    end)
+  end))
+  task.spawn(function()
+    while State.running do
+      pcall(storeAll)
+      task.wait(5)
+    end
+  end)
+  task.spawn(function()
+    while State.running do
+      pcall(trySpin)
+      task.wait(5)
+    end
+  end)
+end
+
 local function Stop()
   pcall(saveConfig)
   Config.BatterySaver, Config.BoostFPS = false, false
   pcall(applyPerf)
-  State.running, State.active, State.lock = false, false, nil
+  State.running, State.active, State.lock, State.noClick = false, false, nil, false
   for _, c in ipairs(State.conns) do pcall(function() c:Disconnect() end) end
   for p, v in pairs(savedCollide) do if p.Parent then p.CanCollide = v end end
   if State.gui then State.gui:Destroy() end
@@ -1361,6 +1657,8 @@ local T = {
   text    = Color3.fromRGB(242, 233, 220),
   dim     = Color3.fromRGB(165, 148, 175),
   dark    = Color3.fromRGB(25, 12, 0),
+  gold    = Color3.fromRGB(255, 205, 70),
+  sel     = Color3.fromRGB(60, 34, 66),
 }
 local function fontOr(name, fallback)
   local ok, f = pcall(function() return Enum.Font[name] end)
@@ -1422,6 +1720,61 @@ local function makeDraggable(handle, target, onTap)
   end))
 end
 
+------------------------------------------------------------------
+-- UI: SONS (arquivos que já vêm no próprio Roblox)
+------------------------------------------------------------------
+local SFX = {
+  click   = {"rbxasset://sounds/clickfast.wav", 1.0, 0.45},
+  tab     = {"rbxasset://sounds/clickfast.wav", 1.25, 0.35},
+  on      = {"rbxasset://sounds/clickfast.wav", 1.35, 0.5},
+  off     = {"rbxasset://sounds/clickfast.wav", 0.8, 0.45},
+  type    = {"rbxasset://sounds/clickfast.wav", 1.7, 0.22},
+  open    = {"rbxasset://sounds/swoosh.wav", 1.1, 0.55},
+  close   = {"rbxasset://sounds/swoosh.wav", 0.8, 0.5},
+  thunder = {"rbxasset://sounds/swoosh.wav", 0.35, 0.8},
+  notify  = {"rbxasset://sounds/electronicpingshort.wav", 1.0, 0.45},
+  warn    = {"rbxasset://sounds/electronicpingshort.wav", 0.75, 0.55},
+  err     = {"rbxasset://sounds/electronicpingshort.wav", 0.55, 0.6},
+  win     = {"rbxasset://sounds/victory.wav", 1.0, 0.5},
+}
+local sfxCache = {}
+local function sfx(name)
+  if not Config.SoundOn then return end
+  local def = SFX[name]
+  if not def then return end
+  pcall(function()
+    local s = sfxCache[name]
+    if not (s and s.Parent) then
+      s = Instance.new("Sound")
+      s.SoundId, s.PlaybackSpeed = def[1], def[2]
+      s.Parent = SoundService
+      sfxCache[name] = s
+    end
+    s.Volume = def[3] * Config.Volume * 2
+    s.TimePosition = 0
+    s:Play()
+  end)
+end
+
+local function pressFx(o)
+  local sc = o:FindFirstChildOfClass("UIScale") or new("UIScale", {Parent = o})
+  tween(sc, 0.06, {Scale = 0.95})
+  task.delay(0.07, function() tween(sc, 0.25, {Scale = 1}, Enum.EasingStyle.Back) end)
+end
+
+-- brasas subindo dentro de um container
+local function ember(parent)
+  local s = math.random(2, 5)
+  local e = new("Frame", {Size = UDim2.fromOffset(s, s), Position = UDim2.new(math.random(), 0, 1, 4),
+    BackgroundColor3 = math.random() < 0.7 and T.orange or T.orange2, BackgroundTransparency = 0.15,
+    BorderSizePixel = 0, Parent = parent})
+  corner(e, s)
+  local dur = 2.5 + math.random() * 3
+  tween(e, dur, {Position = UDim2.new(e.Position.X.Scale + (math.random() - 0.5) * 0.25, 0, -0.05, 0),
+    BackgroundTransparency = 1}, Enum.EasingStyle.Sine)
+  task.delay(dur + 0.05, function() e:Destroy() end)
+end
+
 local function makeGui()
   local gui = new("ScreenGui", {Name = "ClaudeHub", ResetOnSpawn = false, IgnoreGuiInset = true,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999})
@@ -1438,36 +1791,45 @@ end
 ------------------------------------------------------------------
 local function buildToasts(gui)
   local box = new("Frame", {AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 70),
-    Size = UDim2.fromOffset(250, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(256, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
     ZIndex = 30, Parent = gui})
   table.insert(State.avoid, box)
   new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = box})
   local KIND = {
-    info = {T.purple, "👻"}, ok = {T.green, "🎃"}, warn = {T.orange, "⚠️"}, err = {T.red, "💀"},
+    info = {T.purple, "👻", "notify"}, ok = {T.green, "🎃", "notify"}, warn = {T.orange, "⚠️", "warn"},
+    err = {T.red, "💀", "err"}, win = {T.gold, "🏆", "win"},
   }
-  local n = 0
+  local n, lastSound = 0, 0
   notify = function(title, text, kind, dur)
     if not (State.running and box.Parent) then return end
     local k = KIND[kind or "info"] or KIND.info
+    dur = dur or 3.5
     n = n + 1
-    local holder = new("Frame", {Size = UDim2.fromOffset(250, 56), BackgroundTransparency = 1, LayoutOrder = n, Parent = box})
-    local card = new("Frame", {Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(280, 0),
-      BackgroundColor3 = T.panel, Parent = holder})
-    corner(card, 10) stroke(card, k[1], 1, 0.35)
-    corner(new("Frame", {Size = UDim2.new(0, 4, 1, -14), Position = UDim2.fromOffset(7, 7),
+    if os.clock() - lastSound > 0.3 then lastSound = os.clock() sfx(k[3]) end
+    local holder = new("Frame", {Size = UDim2.fromOffset(256, 60), BackgroundTransparency = 1, LayoutOrder = n, Parent = box})
+    local card = new("Frame", {Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(290, 0),
+      BackgroundColor3 = T.panel, ClipsDescendants = true, Parent = holder})
+    corner(card, 12) stroke(card, k[1], 1.2, 0.25)
+    new("UIGradient", {Color = ColorSequence.new(T.panel, T.bg2), Rotation = 0, Parent = card})
+    corner(new("Frame", {Size = UDim2.new(0, 4, 1, -16), Position = UDim2.fromOffset(8, 8),
       BackgroundColor3 = k[1], BorderSizePixel = 0, Parent = card}), 2)
-    new("TextLabel", {Text = k[2], TextSize = 20, Font = F.bold, BackgroundTransparency = 1, TextColor3 = T.text,
-      Size = UDim2.fromOffset(30, 56), Position = UDim2.fromOffset(14, 0), Parent = card})
+    local icon = new("TextLabel", {Text = k[2], TextSize = 22, Font = F.bold, BackgroundTransparency = 1,
+      TextColor3 = T.text, Size = UDim2.fromOffset(32, 60), Position = UDim2.fromOffset(15, 0), Parent = card})
+    local iscale = new("UIScale", {Scale = 0, Parent = icon})
     new("TextLabel", {Text = title, Font = F.bold, TextSize = 13, TextColor3 = k[1], BackgroundTransparency = 1,
-      Position = UDim2.fromOffset(48, 8), Size = UDim2.new(1, -56, 0, 18),
+      Position = UDim2.fromOffset(52, 9), Size = UDim2.new(1, -60, 0, 18),
       TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card})
     new("TextLabel", {Text = text or "", Font = F.body, TextSize = 11, TextColor3 = T.dim, BackgroundTransparency = 1,
-      Position = UDim2.fromOffset(48, 27), Size = UDim2.new(1, -56, 0, 24), TextWrapped = true,
+      Position = UDim2.fromOffset(52, 28), Size = UDim2.new(1, -60, 0, 24), TextWrapped = true,
       TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = card})
-    tween(card, 0.35, {Position = UDim2.fromOffset(0, 0)}, Enum.EasingStyle.Back)
-    task.delay(dur or 3.5, function()
+    local bar = new("Frame", {AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1),
+      Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = k[1], BorderSizePixel = 0, Parent = card})
+    tween(card, 0.45, {Position = UDim2.fromOffset(0, 0)}, Enum.EasingStyle.Back)
+    task.delay(0.12, function() tween(iscale, 0.35, {Scale = 1}, Enum.EasingStyle.Back) end)
+    TweenService:Create(bar, TweenInfo.new(dur, Enum.EasingStyle.Linear), {Size = UDim2.new(0, 0, 0, 2)}):Play()
+    task.delay(dur, function()
       if not card.Parent then return end
-      tween(card, 0.3, {Position = UDim2.fromOffset(280, 0)})
+      tween(card, 0.3, {Position = UDim2.fromOffset(290, 0)})
       task.wait(0.32)
       holder:Destroy()
     end)
@@ -1484,57 +1846,144 @@ end
 -- UI: TELA DE CARREGAMENTO
 ------------------------------------------------------------------
 local function runLoading(gui, steps)
+  local cine = Config.Cinematic
   local overlay = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
-    BackgroundTransparency = 1, ZIndex = 20, Parent = gui})
-  tween(overlay, 0.4, {BackgroundTransparency = 0.3})
+    BackgroundTransparency = 1, ZIndex = 20, ClipsDescendants = true, Parent = gui})
+  tween(overlay, 0.6, {BackgroundTransparency = 0.12})
 
+  -- céu: névoa roxa embaixo, lua com brilho, relâmpago
+  local fog = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = T.bg2, BackgroundTransparency = 0.25,
+    BorderSizePixel = 0, Parent = overlay})
+  new("UIGradient", {Rotation = 90, Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.6, 0.85), NumberSequenceKeypoint.new(1, 0.1)}), Parent = fog})
+  local moon = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.83, 0.26),
+    Size = UDim2.fromOffset(86, 86), BackgroundColor3 = Color3.fromRGB(255, 214, 150), BackgroundTransparency = 1,
+    BorderSizePixel = 0, Parent = overlay})
+  corner(moon, 43)
+  local glow = new("UIStroke", {Color = T.orange, Thickness = 16, Transparency = 1, Parent = moon})
+  tween(moon, 1.4, {BackgroundTransparency = 0.05})
+  tween(glow, 1.4, {Transparency = 0.78})
+  local flash = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(225, 215, 255),
+    BackgroundTransparency = 1, BorderSizePixel = 0, Parent = overlay})
+  local function lightning()
+    if not cine then return end
+    sfx("thunder")
+    flash.BackgroundTransparency = 0.45
+    tween(flash, 0.1, {BackgroundTransparency = 1})
+    task.wait(0.14)
+    flash.BackgroundTransparency = 0.65
+    tween(flash, 0.4, {BackgroundTransparency = 1})
+  end
+
+  -- brasas e criaturas
+  local alive_ = true
+  task.spawn(function()
+    while alive_ do
+      if cine then ember(overlay) end
+      task.wait(0.09)
+    end
+  end)
   local floaters = {}
   for i = 1, 6 do
-    floaters[i] = new("TextLabel", {Text = ({"🦇", "👻", "🎃"})[i % 3 + 1], TextSize = 22 + (i % 3) * 4,
-      BackgroundTransparency = 1, TextTransparency = 0.25, Size = UDim2.fromOffset(34, 34),
-      Position = UDim2.fromScale(math.random() * 0.9, math.random() * 0.9), Parent = overlay})
+    floaters[i] = new("TextLabel", {Text = ({"🦇", "👻", "🦇"})[i % 3 + 1], TextSize = 20 + (i % 3) * 5,
+      BackgroundTransparency = 1, TextTransparency = 0.3, Size = UDim2.fromOffset(34, 34),
+      Position = UDim2.fromScale(math.random() * 0.9, math.random() * 0.7), Parent = overlay})
   end
-  local animating = true
   task.spawn(function()
-    while animating do
+    while alive_ do
       for _, f in ipairs(floaters) do
-        tween(f, 1.8, {Position = UDim2.fromScale(math.random() * 0.9, math.random() * 0.9)}, Enum.EasingStyle.Sine)
+        tween(f, 1.9, {Position = UDim2.fromScale(math.random() * 0.9, math.random() * 0.7)}, Enum.EasingStyle.Sine)
       end
-      task.wait(1.8)
+      task.wait(1.9)
     end
   end)
 
-  local card = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromOffset(330, 196), BackgroundColor3 = T.bg, Parent = overlay})
-  corner(card, 16) stroke(card, T.orange, 1.5, 0.25)
+  -- faixas de cinema
+  local barTop = new("Frame", {Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Color3.new(0, 0, 0),
+    BorderSizePixel = 0, ZIndex = 5, Parent = overlay})
+  local barBot = new("Frame", {AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1),
+    Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, ZIndex = 5, Parent = overlay})
+  if cine then
+    tween(barTop, 0.9, {Size = UDim2.new(1, 0, 0.11, 0)})
+    tween(barBot, 0.9, {Size = UDim2.new(1, 0, 0.11, 0)})
+  end
+
+  -- cartão de vidro
+  local card = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.52),
+    Size = UDim2.fromOffset(340, 204), BackgroundColor3 = T.bg, BackgroundTransparency = 0.08, ZIndex = 6, Parent = overlay})
+  corner(card, 18)
+  local cstroke = new("UIStroke", {Color = Color3.new(1, 1, 1), Thickness = 1.8, Transparency = 0.1,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = card})
+  local cgrad = new("UIGradient", {Color = ColorSequence.new({ColorSequenceKeypoint.new(0, T.orange),
+    ColorSequenceKeypoint.new(0.5, T.purple), ColorSequenceKeypoint.new(1, T.orange)}), Parent = cstroke})
   new("UIGradient", {Color = ColorSequence.new(T.bg, T.bg2), Rotation = 90, Parent = card})
-  local cscale = new("UIScale", {Scale = 0.6, Parent = card})
-  tween(cscale, 0.5, {Scale = 1}, Enum.EasingStyle.Back)
+  local cscale = new("UIScale", {Scale = 0.55, Parent = card})
+  tween(cscale, 0.6, {Scale = 1}, Enum.EasingStyle.Back)
+  task.spawn(function()
+    while alive_ and card.Parent do
+      cgrad.Rotation = (cgrad.Rotation + 3) % 360
+      task.wait()
+    end
+  end)
 
-  new("TextLabel", {Text = "🎃", TextSize = 34, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 40),
-    Position = UDim2.fromOffset(0, 10), Parent = card})
-  local title = new("TextLabel", {Text = "CLAUDE HUB", Font = F.title, TextSize = 40, TextColor3 = Color3.new(1, 1, 1),
-    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 44), Position = UDim2.fromOffset(0, 48), Parent = card})
+  local pump = new("TextLabel", {Text = "🎃", TextSize = 36, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 42),
+    Position = UDim2.fromOffset(0, 10), ZIndex = 7, Parent = card})
+  local pscale = new("UIScale", {Parent = pump})
+  task.spawn(function()
+    while alive_ and pump.Parent do
+      tween(pscale, 0.6, {Scale = 1.12}, Enum.EasingStyle.Sine)
+      task.wait(0.6)
+      tween(pscale, 0.6, {Scale = 1}, Enum.EasingStyle.Sine)
+      task.wait(0.6)
+    end
+  end)
+  local title = new("TextLabel", {Text = "", Font = F.title, TextSize = 42, TextColor3 = Color3.new(1, 1, 1),
+    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 46), Position = UDim2.fromOffset(0, 50), ZIndex = 7, Parent = card})
   new("UIGradient", {Color = ColorSequence.new(T.orange, T.orange2), Rotation = 90, Parent = title})
-  new("TextLabel", {Text = "Halloween Edition  •  Blox Fruits", Font = F.semi, TextSize = 12, TextColor3 = T.dim,
-    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16), Position = UDim2.fromOffset(0, 94), Parent = card})
+  new("UIStroke", {Color = T.orange, Thickness = 2, Transparency = 0.55, Parent = title})
+  local sub = new("TextLabel", {Text = "HALLOWEEN EDITION  •  BLOX FRUITS", Font = F.bold, TextSize = 11,
+    TextColor3 = T.dim, TextTransparency = 1, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
+    Position = UDim2.fromOffset(0, 98), ZIndex = 7, Parent = card})
 
-  local bar = new("Frame", {Position = UDim2.new(0, 24, 0, 130), Size = UDim2.new(1, -48, 0, 8),
-    BackgroundColor3 = T.panel, BorderSizePixel = 0, Parent = card})
+  local bar = new("Frame", {Position = UDim2.new(0, 26, 0, 134), Size = UDim2.new(1, -52, 0, 8),
+    BackgroundColor3 = T.panel, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 7, Parent = card})
   corner(bar, 4)
-  local fill = new("Frame", {Size = UDim2.fromScale(0, 1), BackgroundColor3 = T.orange, BorderSizePixel = 0, Parent = bar})
+  local fill = new("Frame", {Size = UDim2.fromScale(0, 1), BackgroundColor3 = T.orange, BorderSizePixel = 0,
+    ZIndex = 8, Parent = bar})
   corner(fill, 4)
   new("UIGradient", {Color = ColorSequence.new(T.purple, T.orange), Parent = fill})
-  local stepL = new("TextLabel", {Text = "Iniciando...", Font = F.body, TextSize = 11, TextColor3 = T.text,
-    BackgroundTransparency = 1, Size = UDim2.new(1, -48, 0, 16), Position = UDim2.new(0, 24, 0, 144),
-    TextXAlignment = Enum.TextXAlignment.Left, Parent = card})
+  local shine = new("Frame", {Size = UDim2.fromScale(0.35, 1), Position = UDim2.fromScale(-0.4, 0),
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 9, Parent = bar})
+  new("UIGradient", {Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(0.5, 0.55), NumberSequenceKeypoint.new(1, 1)}), Parent = shine})
+  task.spawn(function()
+    while alive_ and shine.Parent do
+      shine.Position = UDim2.fromScale(-0.4, 0)
+      tween(shine, 1.1, {Position = UDim2.fromScale(1.05, 0)}, Enum.EasingStyle.Sine)
+      task.wait(1.4)
+    end
+  end)
+  local stepL = new("TextLabel", {Text = "", Font = F.body, TextSize = 11, TextColor3 = T.text,
+    BackgroundTransparency = 1, Size = UDim2.new(1, -110, 0, 16), Position = UDim2.new(0, 26, 0, 148),
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 7, Parent = card})
   local pct = new("TextLabel", {Text = "0%", Font = F.bold, TextSize = 11, TextColor3 = T.orange,
-    BackgroundTransparency = 1, Size = UDim2.new(0, 50, 0, 16), Position = UDim2.new(1, -74, 0, 144),
-    TextXAlignment = Enum.TextXAlignment.Right, Parent = card})
-  new("TextLabel", {Text = "v" .. VERSION, Font = F.body, TextSize = 10, TextColor3 = T.dim,
-    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14), Position = UDim2.new(0, 0, 1, -20), Parent = card})
+    BackgroundTransparency = 1, Size = UDim2.new(0, 60, 0, 16), Position = UDim2.new(1, -86, 0, 148),
+    TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 7, Parent = card})
+  new("TextLabel", {Text = "v" .. VERSION .. "  •  feito pro " .. LP.DisplayName, Font = F.body, TextSize = 10,
+    TextColor3 = T.dim, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14),
+    Position = UDim2.new(0, 0, 1, -22), ZIndex = 7, Parent = card})
 
+  -- abertura: relâmpago, título letra por letra
   task.wait(0.5)
+  task.spawn(lightning)
+  local name = "CLAUDE HUB"
+  for i = 1, #name do
+    title.Text = name:sub(1, i)
+    if name:sub(i, i) ~= " " then sfx("type") end
+    task.wait(cine and 0.07 or 0.01)
+  end
+  tween(sub, 0.5, {TextTransparency = 0})
+
   for i, s in ipairs(steps) do
     stepL.Text = s[1]
     local done, ok, err = false, true, nil
@@ -1551,17 +2000,28 @@ local function runLoading(gui, steps)
     elseif not ok then
       warn("[Claude Hub] " .. s[1] .. " " .. tostring(err))
     end
-    tween(fill, 0.35, {Size = UDim2.fromScale(i / #steps, 1)})
+    tween(fill, 0.4, {Size = UDim2.fromScale(i / #steps, 1)})
     pct.Text = math.floor(i / #steps * 100) .. "%"
-    task.wait(0.3 + math.random() * 0.3)
+    task.wait(cine and (0.25 + math.random() * 0.25) or 0.1)
   end
   stepL.Text = "Pronto! Feliz Halloween 🎃"
-  task.wait(0.6)
-  animating = false
+  task.spawn(lightning)
+  task.wait(0.7)
+
+  -- saída: faixas abrem, cartão some, tela clareia
+  sfx("open")
+  tween(barTop, 0.5, {Size = UDim2.new(1, 0, 0, 0)})
+  tween(barBot, 0.5, {Size = UDim2.new(1, 0, 0, 0)})
+  tween(cscale, 0.35, {Scale = 1.15})
+  task.wait(0.12)
   tween(cscale, 0.3, {Scale = 0})
-  tween(overlay, 0.35, {BackgroundTransparency = 1})
+  tween(overlay, 0.45, {BackgroundTransparency = 1})
+  tween(fog, 0.45, {BackgroundTransparency = 1})
+  tween(moon, 0.45, {BackgroundTransparency = 1})
+  tween(glow, 0.45, {Transparency = 1})
   for _, f in ipairs(floaters) do tween(f, 0.3, {TextTransparency = 1}) end
-  task.wait(0.4)
+  task.wait(0.5)
+  alive_ = false
   overlay:Destroy()
 end
 
@@ -1577,8 +2037,14 @@ local function buildWindow(gui)
   local W, H = 390, 262
   local win = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
     Size = UDim2.fromOffset(W, H), BackgroundColor3 = T.bg, BorderSizePixel = 0, Parent = gui})
-  corner(win, 14) stroke(win, T.orange, 1.2, 0.45)
+  corner(win, 14)
+  local winStroke = new("UIStroke", {Color = Color3.new(1, 1, 1), Thickness = 1.6, Transparency = 0.15,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = win})
+  local winGrad = new("UIGradient", {Color = ColorSequence.new({ColorSequenceKeypoint.new(0, T.orange),
+    ColorSequenceKeypoint.new(0.5, T.purple), ColorSequenceKeypoint.new(1, T.orange)}), Parent = winStroke})
   new("UIGradient", {Color = ColorSequence.new(T.bg, T.bg2), Rotation = 90, Parent = win})
+  local fx = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ClipsDescendants = true, Parent = win})
+  corner(fx, 14)
   local scale = new("UIScale", {Scale = 0, Parent = win})
   local minimizeFn
   table.insert(State.avoid, win)
@@ -1586,7 +2052,7 @@ local function buildWindow(gui)
     local vp = workspace.CurrentCamera.ViewportSize
     return math.min(1, (vp.X - 30) / W, (vp.Y - 30) / H)
   end
-  tween(scale, 0.45, {Scale = fit()}, Enum.EasingStyle.Back)
+  tween(scale, 0.5, {Scale = fit()}, Enum.EasingStyle.Back)
 
   -- cabeçalho
   local header = new("Frame", {Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = T.panel, BorderSizePixel = 0, Parent = win})
@@ -1616,6 +2082,31 @@ local function buildWindow(gui)
   end
   local minB, closeB = hbtn("–", -72), hbtn("×", -38)
   makeDraggable(header, win)
+  local dot = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(1, -86, 0.5, 0),
+    Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.dim, BorderSizePixel = 0, Parent = header})
+  corner(dot, 4)
+  local dotGlow = new("UIStroke", {Color = T.green, Thickness = 0, Transparency = 0.4, Parent = dot})
+
+  -- vida da janela: borda girando, ponto pulsando, brasas no fundo
+  local pulse = 0
+  table.insert(State.conns, RunService.RenderStepped:Connect(function(dt)
+    if not win.Visible then return end
+    if Config.Cinematic then winGrad.Rotation = (winGrad.Rotation + dt * 60) % 360 end
+    pulse = pulse + dt * 4
+    if State.active then
+      dot.BackgroundColor3 = T.green
+      dotGlow.Thickness = 1 + (math.sin(pulse) + 1) * 1.5
+    else
+      dot.BackgroundColor3 = T.dim
+      dotGlow.Thickness = 0
+    end
+  end))
+  task.spawn(function()
+    while State.running and gui.Parent do
+      if win.Visible and Config.Cinematic then ember(fx) end
+      task.wait(0.35)
+    end
+  end)
 
   -- abas
   local side = new("Frame", {Position = UDim2.fromOffset(8, 48), Size = UDim2.new(0, 96, 1, -56),
@@ -1624,15 +2115,38 @@ local function buildWindow(gui)
   new("UIPadding", {PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = side})
   new("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = side})
   local content = new("Frame", {Position = UDim2.fromOffset(112, 48), Size = UDim2.new(1, -120, 1, -56),
-    BackgroundTransparency = 1, Parent = win})
+    BackgroundTransparency = 1, ClipsDescendants = true, Parent = win})
+  local sideFx = new("Frame", {Position = UDim2.fromOffset(8, 48), Size = UDim2.new(0, 96, 1, -56),
+    BackgroundTransparency = 1, ZIndex = 3, Parent = win})
+  local indicator = new("Frame", {Size = UDim2.fromOffset(3, 18), Position = UDim2.fromOffset(2, 11),
+    BackgroundColor3 = T.orange, BorderSizePixel = 0, ZIndex = 3, Parent = sideFx})
+  corner(indicator, 2)
+  new("UIStroke", {Color = T.orange, Thickness = 2, Transparency = 0.6, Parent = indicator})
 
   local pages, tabs, tabN, ord = {}, {}, 0, 0
   local function nxt() ord = ord + 1 return ord end
-  local function selectTab(name)
-    for k, p in pairs(pages) do p.Visible = (k == name) end
+  local current
+  local function selectTab(name, silent)
+    if not silent and name ~= current then sfx("tab") end
+    current = name
+    for k, p in pairs(pages) do
+      if k == name then
+        p.Visible = true
+        if Config.Cinematic then
+          p.Position = UDim2.fromOffset(0, 12)
+          tween(p, 0.3, {Position = UDim2.fromOffset(0, 0)})
+        end
+      else
+        p.Visible = false
+      end
+    end
     for k, b in pairs(tabs) do
-      tween(b, 0.2, {BackgroundColor3 = k == name and T.orange or T.card})
-      b.TextColor3 = k == name and T.dark or T.text
+      local on = k == name
+      tween(b, 0.2, {BackgroundColor3 = on and T.sel or T.card})
+      b.TextColor3 = on and T.orange2 or T.text
+      if on then
+        tween(indicator, 0.3, {Position = UDim2.fromOffset(2, 6 + (b.LayoutOrder - 1) * 33 + 5)}, Enum.EasingStyle.Back)
+      end
     end
   end
   local function page(name, label)
@@ -1686,6 +2200,8 @@ local function buildWindow(gui)
     end
     card.MouseButton1Click:Connect(function()
       Config[key] = not Config[key]
+      sfx(Config[key] and "on" or "off")
+      pressFx(card)
       paint(0.2)
       if onChange then onChange(Config[key]) end
     end)
@@ -1741,6 +2257,8 @@ local function buildWindow(gui)
       BackgroundColor3 = T.card, AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 34), LayoutOrder = nxt(), Parent = p})
     corner(b, 8) stroke(b, color or T.orange, 1, 0.5)
     b.MouseButton1Click:Connect(function()
+      sfx("click")
+      pressFx(b)
       tween(b, 0.08, {BackgroundColor3 = color or T.orange})
       task.delay(0.12, function() tween(b, 0.25, {BackgroundColor3 = T.card}) end)
       cb(b)
@@ -1781,6 +2299,8 @@ local function buildWindow(gui)
     cardN = cardN + 1
     local c = new("Frame", {BackgroundColor3 = T.card, LayoutOrder = cardN, Parent = grid})
     corner(c, 10)
+    new("UIGradient", {Color = ColorSequence.new(T.card, T.bg2), Rotation = 35, Parent = c})
+    stroke(c, T.orange, 1, 0.8)
     local v = new("TextLabel", {Text = "-", Font = F.bold, TextSize = 16, TextColor3 = T.orange,
       BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -20, 0, 22),
       TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = c})
@@ -1796,6 +2316,8 @@ local function buildWindow(gui)
     opened = dashCard("🎃", "Abóboras abertas"),
     jacks  = dashCard("💀", "Jacks"),
     bosses = dashCard("🏆", "Bosses"),
+    fruits = dashCard("🍎", "Frutas pegas"),
+    spins  = dashCard("🎰", "Giros no Spooky"),
   }
   section(home, "AÇÕES RÁPIDAS")
   button(home, "▶  Iniciar tudo", function()
@@ -1828,6 +2350,10 @@ local function buildWindow(gui)
   end)
   toggle(farm, "Rota pelas ilhas", "Sem abóbora aqui, volta onde já viu uma", "PumpkinRoute")
   toggle(farm, "Avisar cada abóbora", nil, "NotifyPumpkins")
+  section(farm, "FRUTAS")
+  toggle(farm, "Pegar frutas spawnadas", "Prioridade: vai pegar e volta pro farm", "AutoFruits")
+  toggle(farm, "Guardar frutas sozinho", "Guarda as frutas da mochila no estoque", "AutoStore")
+  toggle(farm, "Avisar fruta spawnada", nil, "FruitNotify")
   section(farm, "JACK O'LANTERN")
   toggle(farm, "Matar Jack", "Pausa o clique e foca só nele", "KillJack")
   toggle(farm, "Killaura remoto", "RegisterHit, sem clique", "JackRemote")
@@ -1855,6 +2381,15 @@ local function buildWindow(gui)
       else notify("Diagnóstico no console", "Abre o console e me manda", "info", 5) end
     end)
   end)
+  section(ev, "SPOOKY GACHA")
+  toggle(ev, "Girar sozinho", "500 Candy = 1 giro (o jogo deixa 2 por hora)", "AutoSpin", function(on)
+    if on and not State.spinArgs then
+      notify("Falta capturar o giro", "Toca em 'Capturar giro' e gira 1x na mão", "warn", 6)
+    end
+  end)
+  er.spinSaved = statRow(ev, "Giro capturado")
+  er.spins = statRow(ev, "Giros feitos")
+  button(ev, "🎯  Capturar giro (gira 1x na mão)", function() task.spawn(captureSpin) end)
   section(ev, "DOCES")
   er.candy  = statRow(ev, "Candy Corn")
   er.gain   = statRow(ev, "Ganho na sessão")
@@ -1880,6 +2415,9 @@ local function buildWindow(gui)
   local cfg = page("cfg", "⚙️  Ajustes")
   section(cfg, "INTERFACE")
   toggle(cfg, "Minimizar ao ligar o farm", "Evita o clique cair no menu", "AutoMinimize")
+  toggle(cfg, "Sons", "Cliques, avisos e vitória", "SoundOn")
+  slider(cfg, "Volume", "Volume", 0, 1, 0.05, "", function() sfx("click") end)
+  toggle(cfg, "Efeitos de cinema", "Brasas, borda animada, transições", "Cinematic")
   toggle(cfg, "Tela preta (economia)", "Para de desenhar o 3D, poupa bateria", "BatterySaver", function() applyPerf() end)
   toggle(cfg, "Boost de FPS", "Gráfico no mínimo, sem sombra", "BoostFPS", function() applyPerf() end)
   button(cfg, "💾  Salvar configurações", function()
@@ -1944,6 +2482,8 @@ local function buildWindow(gui)
   section(cfg, "BOSS")
   slider(cfg, "Altura acima do boss", "BossHeight", 3, 25, 1, " st")
   slider(cfg, "Fugir com vida abaixo de", "BossSafePct", 10, 60, 5, "%")
+  section(cfg, "SPOOKY GACHA")
+  slider(cfg, "Tentar girar a cada", "SpinEvery", 60, 1800, 30, "s")
   section(cfg, "CLIQUE HUMANO")
   slider(cfg, "Intervalo mínimo", "ClickMin", 0.08, 0.3, 0.01, "s")
   slider(cfg, "Intervalo máximo", "ClickMax", 0.12, 0.5, 0.01, "s")
@@ -1963,6 +2503,7 @@ local function buildWindow(gui)
     time   = statRow(st, "Tempo"),
     speed  = statRow(st, "Velocidade atual"),
     deaths = statRow(st, "Mortes"),
+    fruits = statRow(st, "Frutas pegas / guardadas"),
   }
 
   -- página: Info
@@ -1975,11 +2516,12 @@ local function buildWindow(gui)
     .. "• Soco não registra ou a tela vira PC? Ajustes → Modo de soco.\n"
     .. "• Killaura sem dano? Me manda o console.\n"
     .. "• Doces errados? Evento → Diagnóstico de doces e me manda.\n"
-    .. "• Porta pegando fogo vira portal pro boss Hellfire Gas. Desliga o farm de portas se não quiser lutar.")
+    .. "• Porta pegando fogo vira portal pro boss Hellfire Gas. Desliga o farm de portas se não quiser lutar.\n"
+    .. "• Spooky Gacha: captura o giro 1x perto do Zioles. Se não girar sozinho, fica perto dele.")
   section(info, "CONTROLES")
   para(info, "– minimiza pra abóbora flutuante (arrasta e toca pra abrir).\n× fecha o hub (toca duas vezes).")
 
-  selectTab("home")
+  selectTab("home", true)
 
   -- minimizar / fechar
   local fab = new("TextButton", {Text = "🎃", TextSize = 26, Font = F.bold, BackgroundColor3 = T.panel,
@@ -1988,8 +2530,11 @@ local function buildWindow(gui)
   corner(fab, 25) stroke(fab, T.orange, 2, 0)
   table.insert(State.avoid, fab)
   local function restore()
+    sfx("open")
     fab.Visible = false
     win.Visible = true
+    winStroke.Thickness = 4
+    tween(winStroke, 0.6, {Thickness = 1.6})
     tween(scale, 0.35, {Scale = fit()}, Enum.EasingStyle.Back)
   end
   makeDraggable(fab, fab, restore)
@@ -2001,6 +2546,7 @@ local function buildWindow(gui)
   table.insert(State.avoid, hud)
   minimizeFn = function()
     if not win.Visible then return end
+    sfx("close")
     tween(scale, 0.25, {Scale = 0})
     task.delay(0.26, function() win.Visible = false fab.Visible = true end)
   end
@@ -2051,6 +2597,8 @@ local function buildWindow(gui)
       er.ends.Text = endLeft > 0 and fmt(endLeft) or "acabou"
       er.doors.Text = Doors.scanning and "procurando..." or tostring(#Doors.list)
       er.doorsDone.Text = Doors.done .. " / " .. #Doors.list
+      er.spinSaved.Text = State.spinArgs and "sim" or (Spin.capturing and "capturando..." or "não")
+      er.spins.Text = tostring(Spin.spins)
       er.gain.Text = "+" .. Event.gain.candy .. " candy • +" .. Event.gain.bits .. " bits"
       local mA, mL = moonInfo()
       local moonTxt = mA and ("ATIVA " .. fmt(mL):sub(4)) or fmt(mL):sub(4)
@@ -2062,9 +2610,12 @@ local function buildWindow(gui)
       dash.opened.Text = tostring(Stats.opened)
       dash.jacks.Text = tostring(Stats.jacks)
       dash.bosses.Text = tostring(Stats.bosses)
+      dash.fruits.Text = Fruits.picked .. " (" .. Fruits.stored .. " guardadas)"
+      dash.spins.Text = tostring(Spin.spins)
       hud.Text = "🌕 " .. moonTxt .. "   🍬 +" .. Event.gain.candy .. "   🎃 " .. Stats.opened
       rows.speed.Text = curSpeed() .. " st/s"
       rows.deaths.Text = tostring(Stats.deaths)
+      rows.fruits.Text = Fruits.picked .. " / " .. Fruits.stored
       saver.Visible = Config.BatterySaver
       if Config.BatterySaver then
         saverText.Text = "🎃 CLAUDE HUB farmando\n" .. State.status .. "\n\n🌕 " .. moonTxt .. "   🍬 +"
@@ -2114,6 +2665,7 @@ if State.running then
   startLoops()
   startEventLoop()
   startDoorLoop()
+  startFruitLoop()
   applyPerf()
   State.status = "parado"
   if checks.cfg then notify("Configurações carregadas", "Do jeito que tu deixou da última vez", "info", 4) end
