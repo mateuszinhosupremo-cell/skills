@@ -17,7 +17,9 @@
   v2.4: mata inimigos do evento (vampiro, pirata, esqueleto...), interage com NPC do minigame
   v2.5: mata tudo que nasce das portas e salas, ESP de frutas/ilhas/players
   v2.6: Auto Handle Event: responde diálogo, Treat, prompts da sala, pega doces
-  v2.7: chuta os minigames (tarô com memória das cartas) + gravador de minigame
+  v2.8: portas no ritmo certo (espera abrir e o evento acabar), clique do Treat instantâneo,
+        auto giro do Spooky (vai até o Zioles se precisar), minigames desligados
+  v2.9: hit em grupo, auto Haki (Buso), pulos curtos instantâneos, menos spam de aviso
 
   Se o executor não aceitar colar tudo: salva este arquivo na pasta
   "workspace" do executor e roda:  loadstring(readfile("claude_hub.txt"))()
@@ -38,7 +40,7 @@ local SoundService = game:GetService("SoundService")
 local okVim, VIM   = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVim then VIM = nil end
 local LP = Players.LocalPlayer
-local VERSION = "2.7"
+local VERSION = "2.9"
 
 local Config = {
   FarmPumpkins   = false,
@@ -53,7 +55,7 @@ local Config = {
   AutoDoors      = false,  -- bate nas portas durante a Harvest Moon
   AutoTreat      = true,   -- depois de bater, escolhe "Treat" (doce na hora, sem minigame)
   AutoHandle     = true,   -- resolve o evento da porta: diálogo, prompts da sala, doces
-  GuessMinigames = true,   -- chuta os minigames (tarô com memória, perguntas no chute)
+  GuessMinigames = false,  -- minigames ficam de fora (só coleta e o que dá pra garantir)
   AutoBosses     = true,   -- mata Unbound Werewolf e Hellfire Gas quando aparecem
   SmartTween     = true,   -- se o server puxar de volta, reduz a velocidade sozinho
   PumpkinRoute   = true,   -- sem abóbora por perto, volta onde já viu uma
@@ -62,7 +64,8 @@ local Config = {
   AutoStore      = true,   -- guarda sozinho as frutas da mochila
   FruitNotify    = true,   -- avisa quando uma fruta spawna
   AutoSpin       = false,  -- gira o Spooky Gacha com 500 Candy
-  SpinEvery      = 300,    -- s entre tentativas (o jogo limita 2 giros/h)
+  SpinEvery      = 60,     -- s entre tentativas (o jogo limita 2 giros/h; tentar não custa nada)
+  SpinGoToNPC    = true,   -- vai até o Zioles pra girar e volta pro farm
   SoundOn        = true,   -- sons da interface
   Volume         = 0.6,
   Cinematic      = true,   -- brasas, borda animada, transições
@@ -76,7 +79,10 @@ local Config = {
   BossTimeout    = 600,    -- os dois somem depois de ~10 min
   BossHeight     = 8,      -- altura acima da cabeça do boss
   BossSafePct    = 35,     -- com vida abaixo disso (%), sobe pra recuperar
-  DoorWait       = 4,      -- s parado na porta esperando a resposta
+  DoorWait       = 4,      -- (antigo) mantido por compatibilidade
+  DoorMinWait    = 2,      -- s mínimos parado depois que a porta abre
+  DoorMaxWait    = 14,     -- s máximos esperando o evento da porta
+  DoorGap        = 0.8,    -- s de respiro antes da próxima porta
   DoorNames      = {"halloweendoor", "trickortreat"},
   DoorTextKeys   = {"trick", "treat", "knock", "doce", "porta"},  -- mouse VIM faz o Roblox virar layout de PC no celular   -- minimiza o hub ao ligar o farm (o clique não acerta o menu)
 
@@ -86,6 +92,10 @@ local Config = {
   JackHeight   = 8,
   JackClickH   = 3,
   JackHitDelay = 0.12,
+  MultiHit     = true,  -- cada hit acerta o grupo todo perto do alvo (igual os hubs públicos)
+  HitRadius    = 55,    -- raio do grupo; o remote não alcança muito além disso
+  AutoBuso     = true,  -- liga o Haki de armamento sozinho (mais dano)
+  InstantHop   = 20,    -- até essa distância vai direto, sem tween
 
   ClickMin     = 0.14,
   ClickMax     = 0.26,
@@ -203,6 +213,8 @@ local function applyPerf()
   end
 end
 
+local function setStatus(s) State.status = s end
+
 local function getChar() return LP.Character end
 local function getRoot() local c = getChar() return c and c:FindFirstChild("HumanoidRootPart") end
 local function getHum() local c = getChar() return c and c:FindFirstChildOfClass("Humanoid") end
@@ -253,7 +265,7 @@ local function tweenTo(cf, tries)
   if not root then return false end
   State.lock = nil
   local dist = (root.Position - cf.Position).Magnitude
-  if dist < 8 then root.CFrame = cf return true end
+  if dist < Config.InstantHop then root.CFrame = cf return true end
   local speed = curSpeed()
   local dur = dist / speed
   local tw = TweenService:Create(root, TweenInfo.new(dur, Enum.EasingStyle.Linear), {CFrame = cf})
@@ -418,7 +430,36 @@ end
 ------------------------------------------------------------------
 -- KILLAURA REMOTO
 ------------------------------------------------------------------
-local Hit = {attack = nil, hit = nil, mode = 1, ok = false, required = false}
+local Hit = {attack = nil, hit = nil, mode = 1, ok = false, required = false, lastBuso = 0}
+
+-- lista de hit com o alvo + quem estiver colado nele (o "whole pile" dos hubs)
+function Hit.pile(m, head)
+  local list = {{m, head}}
+  local enemies = workspace:FindFirstChild("Enemies")
+  if not (Config.MultiHit and enemies and m:FindFirstChildOfClass("Humanoid")) then return list end
+  local c = head.Position
+  for _, e in ipairs(enemies:GetChildren()) do
+    if e ~= m and #list < 10 then
+      local h = e:FindFirstChild("Head") or e:FindFirstChild("HumanoidRootPart")
+      local hum = e:FindFirstChildOfClass("Humanoid")
+      if h and hum and hum.Health > 0 and (h.Position - c).Magnitude < Config.HitRadius then
+        list[#list + 1] = {e, h}
+      end
+    end
+  end
+  return list
+end
+
+-- Haki de armamento: o jogo põe "HasBuso" no personagem quando tá ligado
+function Hit.buso()
+  if not Config.AutoBuso or os.clock() - Hit.lastBuso < 6 then return end
+  local c = LP.Character
+  if not c or c:FindFirstChild("HasBuso") then return end
+  Hit.lastBuso = os.clock()
+  local remotes = RS:FindFirstChild("Remotes")
+  local comm = remotes and remotes:FindFirstChild("CommF_")
+  if comm then pcall(function() comm:InvokeServer("Buso") end) end
+end
 
 local function getHitRemotes()
   if Hit.attack and Hit.hit and Hit.attack.Parent and Hit.hit.Parent then return true end
@@ -437,7 +478,8 @@ end
 remoteHit = function(m, part)
   local head = part or m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
   if not (head and getHitRemotes()) then return false end
-  local list = {{m, head}}
+  Hit.buso()
+  local list = Hit.pile(m, head)
   Hit.attack:FireServer(0)
   if Hit.mode == 1 then
     Hit.hit:FireServer(head, list)
@@ -761,7 +803,10 @@ local function killJack(m, kind)
   if boss then
     notify("Boss: " .. m.Name, "Killaura nele até morrer, foco total", "warn", 4)
   elseif kind == "mob" then
-    notify("Trick!", "Matando " .. m.Name, "warn", 2)
+    if os.clock() - (State.lastTrickNote or 0) > 5 then
+      State.lastTrickNote = os.clock()
+      notify("Trick!", "Matando " .. m.Name .. " e o grupo", "warn", 2)
+    end
   else
     notify("Jack O'Lantern!", "Clique pausado, focando só nele", "warn")
   end
@@ -892,6 +937,7 @@ end
 ------------------------------------------------------------------
 -- LOOPS
 ------------------------------------------------------------------
+local spinStep  -- definido no módulo do Spooky Gacha, mais abaixo
 local doorStep  -- definido no módulo de portas, mais abaixo
 local fruitStep -- definido no módulo de frutas, mais abaixo
 local npcStep   -- definido junto das portas, mais abaixo
@@ -907,6 +953,7 @@ local function step()
     local j = findJack()
     if j then State.active = true killJack(j) return end
   end
+  if spinStep and spinStep() then return end
   if npcStep and npcStep() then return end
   if doorStep and doorStep() then return end
   if Config.FarmPumpkins then
@@ -1455,8 +1502,8 @@ local guessTick -- definido logo abaixo
 
 local function handleTick()
   local best, bestS, bestTxt = nil, 0, ""
-  for _, b in ipairs(visibleButtons()) do
-    if not Handle.baseline[b] then
+  for _, b in ipairs(Handle.watch or {}) do
+    if b.Parent and not Handle.baseline[b] and guiVisible(b) then
       local last = Handle.pressed[b]
       if not (last and os.clock() - last < 1.2) then
         local txt = buttonText(b)
@@ -1575,18 +1622,35 @@ end
 
 local function startHandle(seconds)
   if not Config.AutoHandle then return end
-  Handle.baseline = {}
+  Handle.baseline, Handle.watch = {}, {}
   Handle.memory, Handle.matched = setmetatable({}, {__mode = "k"}), setmetatable({}, {__mode = "k"})
   Handle.guesses, Handle.lastGuess = 0, 0
-  for _, b in ipairs(visibleButtons()) do Handle.baseline[b] = true end
+  -- uma varrida só: o que já tá na tela é HUD; o que tá escondido ou nascer depois é candidato
+  local pg = LP:FindFirstChild("PlayerGui")
+  if pg then
+    for _, g in ipairs(pg:GetDescendants()) do
+      if (g:IsA("TextButton") or g:IsA("ImageButton")) and not g:FindFirstAncestor("ClaudeHub") then
+        if guiVisible(g) then Handle.baseline[g] = true else Handle.watch[#Handle.watch + 1] = g end
+      end
+    end
+    if Handle.addConn then Handle.addConn:Disconnect() end
+    Handle.addConn = pg.DescendantAdded:Connect(function(d)
+      if (d:IsA("TextButton") or d:IsA("ImageButton")) and os.clock() < Handle.untilT then
+        Handle.watch[#Handle.watch + 1] = d
+      end
+    end)
+  end
+  Handle.started = os.clock()
   Handle.untilT = os.clock() + seconds
   if Handle.running then return end
   Handle.running = true
   task.spawn(function()
     while State.running and os.clock() < Handle.untilT do
       pcall(handleTick)
-      task.wait(0.35)
+      -- bem rápido nos primeiros segundos (é quando a escolha aparece)
+      task.wait(os.clock() - Handle.started < 8 and 0.08 or 0.3)
     end
+    if Handle.addConn then Handle.addConn:Disconnect() Handle.addConn = nil end
     Handle.running = false
   end)
 end
@@ -1624,6 +1688,27 @@ local function collectPickups()
   return false
 end
 
+-- espera a porta reagir ao toque: o jogo marca DoorOpen / muda o CooldownUntil / apaga o prompt
+local function waitDoorReact(model, prompt, openBefore, cdBefore, timeout)
+  local t0 = os.clock()
+  while os.clock() - t0 < timeout and State.running do
+    if model:GetAttribute("DoorOpen") == true and openBefore ~= true then return true end
+    if model:GetAttribute("CooldownUntil") ~= cdBefore then return true end
+    if prompt and not prompt.Enabled then return true end
+    task.wait(0.1)
+  end
+  return false
+end
+
+local function firePrompt(prompt)
+  if not prompt then return end
+  if fireproximityprompt then
+    pcall(fireproximityprompt, prompt)
+  else
+    pcall(function() prompt:InputHoldBegin() task.wait(prompt.HoldDuration + 0.1) prompt:InputHoldEnd() end)
+  end
+end
+
 local function doDoor(model)
   Doors.visited[model] = true
   local prompt, pos = doorPos(model)
@@ -1635,24 +1720,36 @@ local function doDoor(model)
   log("indo até a porta")
   if not tweenTo(cf) then return end
   State.lock = cf
-  task.wait(0.3)
+  task.wait(0.4)
+  if not doorReady(model) then State.lock = nil return end -- alguém abriu antes de mim
   local before = Event.gain.candy
+  local openBefore, cdBefore = model:GetAttribute("DoorOpen"), model:GetAttribute("CooldownUntil")
   State.lastKnock, State.lastKnockPos = os.clock(), pos
   State.lastOpenPos, State.lastOpenTime = pos, os.clock()
   startHandle(40)
-  if prompt then
-    if fireproximityprompt then
-      pcall(fireproximityprompt, prompt)
-    else
-      pcall(function() prompt:InputHoldBegin() task.wait(prompt.HoldDuration + 0.1) prompt:InputHoldEnd() end)
-    end
+
+  -- 1) bate e ESPERA a porta reagir (até 3s); se não reagir, bate de novo uma vez
+  firePrompt(prompt)
+  local reacted = waitDoorReact(model, prompt, openBefore, cdBefore, 3)
+  if not reacted then
+    log("porta não reagiu, batendo de novo")
+    firePrompt(prompt)
+    reacted = waitDoorReact(model, prompt, openBefore, cdBefore, 3)
   end
   if not Config.AutoHandle then chooseTreat() end
-  -- fica parado esperando a resposta (sair de perto cancela a porta)
-  local t0, inRoom = os.clock(), false
-  while os.clock() - t0 < Config.DoorWait and State.running do
+  if not reacted then
+    log("porta não abriu, pulando")
+    State.lock = nil
+    return
+  end
+  setStatus("porta aberta, esperando o evento")
+
+  -- 2) fica parado até o evento acabar: doce chegou, sala, bicho, ou tempo máximo
+  local t0, inRoom, lastPress = os.clock(), false, Handle.presses
+  local quietSince = os.clock()
+  while State.running and os.clock() - t0 < Config.DoorMaxWait do
     pcall(pollNotifications)
-    if Event.gain.candy > before then break end
+    if Handle.presses ~= lastPress then lastPress, quietSince = Handle.presses, os.clock() end
     local r = getRoot()
     if r and (r.Position - stand).Magnitude > 60 then
       -- o jogo me jogou numa sala: solta a trava pra não brigar com o teleporte
@@ -1662,15 +1759,32 @@ local function doDoor(model)
       task.wait(1.5)
       break
     end
-    task.wait(0.2)
+    local en = workspace:FindFirstChild("Enemies")
+    local mobNear = false
+    if en and r then
+      for _, m in ipairs(en:GetChildren()) do
+        local p = m:FindFirstChild("HumanoidRootPart")
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        if p and hum and hum.Health > 0 and (p.Position - pos).Magnitude < 60 and spawnedFromDoor(p) then
+          mobNear = true
+          break
+        end
+      end
+    end
+    if mobNear then break end
+    local elapsed = os.clock() - t0
+    -- doce chegou e não tem mais diálogo aparecendo: pronto
+    if Event.gain.candy > before and os.clock() - quietSince > 1.5 and elapsed > Config.DoorMinWait then break end
+    task.wait(0.15)
   end
   Doors.done = Doors.done + 1
   local gained = Event.gain.candy - before
   if gained > 0 then notify("Porta: doce!", "+" .. gained .. " Candy Corn", "ok", 2) end
-  -- trick: mata tudo que nasceu perto da porta (ou da sala onde me jogaram)
+
+  -- 3) trick: mata tudo que nasceu perto da porta (ou da sala onde me jogaram)
   local enemies = workspace:FindFirstChild("Enemies")
   if enemies then
-    for _ = 1, 3 do
+    for _ = 1, 4 do
       local any = false
       local r = getRoot()
       local center = (inRoom and r) and r.Position or pos
@@ -1683,7 +1797,7 @@ local function doDoor(model)
         end
       end
       if not any then break end
-      task.wait(0.5)
+      task.wait(0.6)
     end
   end
   if Config.AutoHandle then
@@ -1691,6 +1805,8 @@ local function doDoor(model)
       if not collectPickups() then break end
     end
   end
+  -- 4) respiro antes da próxima porta (o jogo reclama de "várias portas ao mesmo tempo")
+  task.wait(Config.DoorGap)
   State.lock = nil
 end
 
@@ -2116,16 +2232,41 @@ local function captureSpin()
   end
   log("giro capturado: " .. pick.path .. ":" .. pick.method .. "(" .. argsText(pick.args, pick.n) .. ")")
   notify("Giro capturado ✅", pick.remote.Name .. (simple and " • salvo" or " • vale até fechar o hub"), "ok", 7)
+  Config.AutoSpin = true
+  Spin.lastTry = os.clock() - Config.SpinEvery + 5 -- tenta de novo em ~5s
+  if State.refreshToggles then State.refreshToggles() end
 end
 
 local function spinReady()
   return Spin.live ~= nil or (State.spinPath ~= nil and State.spinArgs ~= nil)
 end
 
+local function spinDue()
+  if not (Config.AutoSpin and spinReady()) then return false end
+  if Event.totalOk and Event.candy and Event.candy < 500 then return false end
+  return os.clock() - Spin.lastTry >= Config.SpinEvery
+end
+
+-- acha o Zioles (o modelo guarda a posição mesmo quando o NPC tá longe/descarregado)
+local function findZioles()
+  if Spin.npcPos and os.clock() - (Spin.npcAt or 0) < 120 then return Spin.npcPos end
+  local function scan(root)
+    if not root then return nil end
+    for _, d in ipairs(root:GetDescendants()) do
+      if d:IsA("Model") and string.lower(d.Name):find("zioles", 1, true) then
+        local ok, p = pcall(function() return d:GetPivot().Position end)
+        if ok then return p end
+      end
+    end
+    return nil
+  end
+  local p = scan(workspace:FindFirstChild("NPCs")) or scan(RS:FindFirstChild("NPCs"))
+  Spin.npcPos, Spin.npcAt = p, os.clock()
+  return p
+end
+
 local function trySpin()
-  if not (Config.AutoSpin and spinReady()) then return end
-  if Event.totalOk and Event.candy and Event.candy < 500 then return end
-  if os.clock() - Spin.lastTry < Config.SpinEvery then return end
+  if not spinDue() then return end
   local remote, method, args, n
   if Spin.live and Spin.live.remote.Parent then
     remote, method, args, n = Spin.live.remote, Spin.live.method, Spin.live.args, Spin.live.n
@@ -2136,10 +2277,12 @@ local function trySpin()
   Spin.lastTry = os.clock()
   local t0 = os.clock()
   local unpackF = table.unpack or unpack
-  pcall(function()
-    if method == "FireServer" then remote:FireServer(unpackF(args, 1, n)) else remote:InvokeServer(unpackF(args, 1, n)) end
+  local okCall, res = pcall(function()
+    if method == "FireServer" then remote:FireServer(unpackF(args, 1, n)) return true end
+    return remote:InvokeServer(unpackF(args, 1, n))
   end)
-  task.wait(3)
+  log("giro enviado -> " .. tostring(okCall) .. " / " .. tostring(res))
+  task.wait(2.5)
   pcall(pollNotifications)
   if Event.otherTime and Event.otherTime >= t0 then
     Spin.spins = Spin.spins + 1
@@ -2233,6 +2376,26 @@ local function recordMinigame(seconds)
   Rec.running = false
 end
 
+spinStep = function()
+  if not (Config.SpinGoToNPC and spinDue()) then return false end
+  local npc, root = findZioles(), getRoot()
+  if not (npc and root) or (root.Position - npc).Magnitude < 45 then return false end
+  State.active = true
+  local back = root.Position
+  setStatus("indo girar no Zioles")
+  notify("Spooky Gacha 🎰", "Indo até o Zioles girar", "info", 3)
+  if tweenTo(CFrame.new(npc + Vector3.new(0, 3, 6))) then
+    State.lock = CFrame.new(npc + Vector3.new(0, 3, 6))
+    task.wait(0.5)
+    trySpin()
+    State.lock = nil
+  else
+    Spin.lastTry = os.clock()
+  end
+  if (Config.FarmPumpkins or Config.AutoDoors) and alive() then tweenTo(CFrame.new(back)) end
+  return true
+end
+
 local function startFruitLoop()
   table.insert(State.conns, workspace.ChildAdded:Connect(function(o)
     task.delay(0.6, function()
@@ -2251,7 +2414,8 @@ local function startFruitLoop()
   end)
   task.spawn(function()
     while State.running do
-      pcall(trySpin)
+      local npc, root = (Config.SpinGoToNPC and findZioles()) or nil, getRoot()
+      if not (npc and root and (root.Position - npc).Magnitude >= 45) then pcall(trySpin) end
       task.wait(5)
     end
   end)
@@ -2955,6 +3119,7 @@ local function buildWindow(gui)
 
   local painters = {}
   local function refreshToggles() for _, f in ipairs(painters) do f(0.2) end end
+  State.refreshToggles = refreshToggles
 
   local function toggle(p, label, desc, key, onChange)
     local h = desc and 46 or 36
@@ -3161,8 +3326,7 @@ local function buildWindow(gui)
   toggle(ev, "Farm de portas", "Só portas de verdade, 1x por lua", "AutoDoors")
   toggle(ev, "Auto Handle Event", "Diálogo, Treat, prompts da sala e doces", "AutoHandle")
   toggle(ev, "Preferir Treat", "Doce na hora, pula os minigames", "AutoTreat")
-  toggle(ev, "Chutar minigames", "Tarô com memória das cartas, perguntas no chute", "GuessMinigames")
-  button(ev, "🎥  Gravar minigame (20s)", function() task.spawn(recordMinigame, 20) end)
+
   er.doors = statRow(ev, "Portas reais / prontas")
   er.doorsDone = statRow(ev, "Batidas nesta lua")
   er.handled = statRow(ev, "Respostas automáticas")
@@ -3180,7 +3344,15 @@ local function buildWindow(gui)
   end)
   er.spinSaved = statRow(ev, "Giro capturado")
   er.spins = statRow(ev, "Giros feitos")
+  toggle(ev, "Ir até o Zioles", "Viaja pra girar e volta pro farm", "SpinGoToNPC")
   button(ev, "🎯  Capturar giro (toca e gira 1x na mão)", function() task.spawn(captureSpin) end)
+  button(ev, "🎰  Girar agora", function()
+    if not spinReady() then notify("Falta capturar o giro", "Toca em Capturar e gira 1x na mão", "warn", 5) return end
+    Spin.lastTry = 0
+    local was = Config.AutoSpin
+    Config.AutoSpin = true
+    task.spawn(function() trySpin() Config.AutoSpin = was end)
+  end)
   section(ev, "DOCES")
   er.candy  = statRow(ev, "Candy Corn")
   er.gain   = statRow(ev, "Ganho na sessão")
@@ -3278,12 +3450,19 @@ local function buildWindow(gui)
   slider(cfg, "Altura no remoto", "JackHeight", 3, 15, 1, " st")
   slider(cfg, "Altura no clique", "JackClickH", 1, 6, 0.5, " st")
   slider(cfg, "Intervalo do killaura", "JackHitDelay", 0.05, 0.4, 0.01, "s")
+  section(cfg, "COMBATE")
+  toggle(cfg, "Hit em grupo", "Cada hit pega todo mundo perto do alvo", "MultiHit")
+  slider(cfg, "Raio do hit em grupo", "HitRadius", 20, 60, 5, " st")
+  toggle(cfg, "Auto Haki (Buso)", "Liga o Haki de armamento sozinho", "AutoBuso")
   section(cfg, "BOSS")
   slider(cfg, "Altura acima do boss", "BossHeight", 3, 25, 1, " st")
   slider(cfg, "Fugir com vida abaixo de", "BossSafePct", 10, 60, 5, "%")
   slider(cfg, "Raio do 'qualquer bicho'", "KillAllRadius", 40, 300, 10, " st")
   section(cfg, "SPOOKY GACHA")
-  slider(cfg, "Tentar girar a cada", "SpinEvery", 60, 1800, 30, "s")
+  slider(cfg, "Tentar girar a cada", "SpinEvery", 30, 1800, 30, "s")
+  section(cfg, "PORTAS")
+  slider(cfg, "Tempo mínimo na porta", "DoorMinWait", 1, 8, 0.5, "s")
+  slider(cfg, "Tempo máximo na porta", "DoorMaxWait", 6, 30, 1, "s")
   section(cfg, "CLIQUE HUMANO")
   slider(cfg, "Intervalo mínimo", "ClickMin", 0.08, 0.3, 0.01, "s")
   slider(cfg, "Intervalo máximo", "ClickMax", 0.12, 0.5, 0.01, "s")
@@ -3451,6 +3630,7 @@ buildToasts(gui)
 
 local checks = {}
 checks.cfg = loadConfig()
+Config.GuessMinigames = false
 runLoading(gui, {
   {"Verificando executor...", function() checks.vim = VIM ~= nil end},
   {"Procurando abóboras (PumpkinHunt)...", function()
