@@ -58,6 +58,8 @@ local DEFAULTS = {
     ChestMaxFails    = 2,       -- falhas no mesmo bau antes de ignorar ele
     ChestIgnoreTime  = 45,      -- segundos ignorando bau que falhou
     ChestNoclip      = true,    -- atravessa parede no caminho
+    ChestStreamWait  = 2.0,     -- teto esperando a area RENDERIZAR apos o TP (streaming)
+    ChestSettle      = 0.12,    -- respiro extra depois que carregou, antes de tocar
 
     -- geral
     RejoinOnDrop    = true,
@@ -555,6 +557,37 @@ do
         return paid, os.clock() - t0
     end
 
+    -- TP pra regiao do bau e espera ela CARREGAR (renderizar) antes de tocar.
+    -- pede o stream de forma SINCRONA (espera retornar) e confirma que o chao
+    -- sob o bau existe de verdade. teto de tempo pra nao travar.
+    local function streamWait(p)
+        local pos = p.Position
+        -- 1) fica em cima pra virar o centro do streaming, pedindo a area
+        local ok = false
+        local t0 = os.clock()
+        -- RequestStreamAroundAsync YIELDA ate a area em volta carregar (com timeout)
+        pcall(function() lp:RequestStreamAroundAsync(pos, CFG.ChestStreamWait) end)
+        -- 2) confirma: a parte do bau precisa existir E ter chao embaixo
+        while os.clock() - t0 < CFG.ChestStreamWait do
+            if not T.chest or not Core.alive() then return false end
+            local r = Core.root
+            if r then r.CFrame = p.Parent and p.CFrame or CFrame.new(pos) end
+            local loaded = p.Parent ~= nil and p:IsDescendantOf(workspace)
+            if loaded then
+                -- raycast curto pra baixo: se bateu em algo, o terreno carregou
+                local rp = RaycastParams.new()
+                rp.FilterType = Enum.RaycastFilterType.Exclude
+                rp.FilterDescendantsInstances = { Core.char }
+                local hit = workspace:Raycast(pos + Vector3.new(0,6,0), Vector3.new(0,-40,0), rp)
+                if hit then ok = true; break end
+            end
+            task.wait(0.05)
+        end
+        if ok and CFG.ChestSettle > 0 then task.wait(CFG.ChestSettle) end
+        if not ok then Core.log("area nao renderizou a tempo - pulando bau") end
+        return ok
+    end
+
     function Feat.chestStop()
         Feat.chestBusy = false
         setNoclip(false)
@@ -569,16 +602,25 @@ do
         if not p then task.wait(1); return end
 
         Feat.chestBusy = true
-        -- carrega a area antes (StreamingEnabled): evita bau "fantasma"
-        if workspace.StreamingEnabled then
-            task.spawn(function() pcall(function() lp:RequestStreamAroundAsync(p.Position) end) end)
-        end
-        if not isLive(p) then Feat.chestBusy = false; return end
-
         setNoclip(true)
         local before = beli()
+
+        -- 1) TP pra cima do bau (leva teu personagem pra regiao)
         local arrived = tpTo(p)
+
+        -- 2) ESPERA a area renderizar de verdade antes de tocar.
+        --    e isso que resolve o "so conta depois do nome da cidade aparecer":
+        --    o nome aparece quando a regiao terminou de carregar. aqui a gente
+        --    espera o mesmo evento em vez de tocar num bau meio-carregado.
+        if arrived and workspace.StreamingEnabled then
+            arrived = streamWait(p)
+        end
+
         if arrived and isLive(p) then
+            -- reancora: apos carregar, a instancia do bau pode ter sido recriada
+            local fresh = nextChest()
+            if fresh and (fresh.Position - p.Position).Magnitude < 8 then p = fresh end
+            tpTo(p)
             local paid, took = holdUntilPaid(p, before)
             if paid then
                 local gain = (before and beli()) and (beli() - before) or 0
@@ -810,6 +852,7 @@ local function buildGui()
     mkSlider(tune, "Attack Range", "AttackRange", 100, 600, 10)
     mkSlider(tune, "Attack Interval", "AttackInterval", 0.05, 1, 0.05)
     mkSlider(tune, "Chest Hold (delay)", "ChestHold", 0.05, 0.6, 0.01)
+    mkSlider(tune, "Chest Stream Wait", "ChestStreamWait", 0.5, 4, 0.1)
     mkSlider(tune, "Chest Max Wait", "ChestMaxWait", 0.3, 2.0, 0.1)
     mkSlider(tune, "Call Cooldown", "CallCooldown", 0.05, 0.5, 0.01)
 
