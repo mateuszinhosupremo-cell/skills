@@ -392,7 +392,7 @@ do
     local live      = {}  -- [touchPart] = chestInstance
     local fails     = {}  -- [touchPart] = n
     local ignored   = {}  -- [touchPart] = os.clock() ate quando ignorar
-    local requireTI = true
+    local requireTI = false
     local warnedBeli = false
 
     local function isChestName(inst)
@@ -420,7 +420,9 @@ do
 
     local function isLive(p)
         if not p or not p.Parent or not p:IsDescendantOf(workspace) then return false end
-        if not p.CanTouch or p.Transparency >= 0.95 then return false end
+        if not p.CanTouch then return false end
+        -- visivel OU tem TouchInterest (BF tem baus solidos sem TT ate encostar)
+        if p.Transparency >= 0.95 and not p:FindFirstChildWhichIsA("TouchTransmitter") then return false end
         if requireTI and not p:FindFirstChildWhichIsA("TouchTransmitter") then return false end
         return true
     end
@@ -454,11 +456,8 @@ do
             total += 1
             if p:FindFirstChildWhichIsA("TouchTransmitter") then withTI += 1 end
         end
-        local was = requireTI
-        requireTI = not (total > 0 and withTI == 0)
-        if was ~= requireTI and not requireTI then
-            Core.log("baus sem TouchInterest visivel - filtro relaxado")
-        end
+        -- so aperta o filtro se TODO bau tiver TouchInterest (nao e o caso do BF)
+        requireTI = (total > 0 and withTI == total)
         return total
     end
 
@@ -594,7 +593,7 @@ do
         Feat.chestBusy = true
         -- carrega a area antes (StreamingEnabled): evita bau "fantasma"
         if workspace.StreamingEnabled then
-            pcall(function() lp:RequestStreamAroundAsync(p.Position, 2) end)
+            task.spawn(function() pcall(function() lp:RequestStreamAroundAsync(p.Position) end) end)
         end
         if not isLive(p) then Feat.chestBusy = false; return end
 
