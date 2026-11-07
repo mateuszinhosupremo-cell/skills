@@ -53,9 +53,8 @@ local DEFAULTS = {
     -- baus
     ChestTag        = "_ChestTagged",
     ChestNames      = { "Chest1", "Chest2", "Chest3" },
-    ChestTravelSpeed = 150,     -- studs/s indo pro bau (abaixo do limite de kick)
-    ChestMaxWait     = 1.2,     -- maximo parado no bau esperando o servidor contar
-    ChestMinWait     = 0.25,    -- minimo parado no bau (deixa a posicao replicar)
+    ChestHold        = 0.18,     -- DELAYZIN parado em cima do bau (sobe se nao contar)
+    ChestMaxWait     = 0.9,      -- teto de espera esperando o Beli subir
     ChestMaxFails    = 2,       -- falhas no mesmo bau antes de ignorar ele
     ChestIgnoreTime  = 45,      -- segundos ignorando bau que falhou
     ChestNoclip      = true,    -- atravessa parede no caminho
@@ -519,39 +518,17 @@ do
         end
     end
 
-    -- anda ate o alvo numa velocidade fixa, frame a frame.
-    -- se o servidor puxar de volta (rubberband), reduz a velocidade.
-    local function travelTo(p)
+    -- TP INSTANTANEO: pula direto em cima do bau (um frame). sem tween.
+    local function tpTo(p)
         local r = Core.root
-        if not r then return false end
-        local startDist = (p.Position - r.Position).Magnitude
-        local deadline = os.clock() + startDist / math.max(CFG.ChestTravelSpeed, 30) * 2 + 4
-        local lastSet
-        while T.chest and Core.alive() and isLive(p) do
-            r = Core.root
-            local cur = r.Position
-            if lastSet and (cur - lastSet).Magnitude > 25 then
-                HUB.stats.snaps += 1
-                CFG.ChestTravelSpeed = math.max(60, math.floor(CFG.ChestTravelSpeed * 0.85))
-                Core.log("rubberband - velocidade baixou pra " .. CFG.ChestTravelSpeed)
-            end
-            local delta = p.Position - cur
-            local dist = delta.Magnitude
-            if dist < 3 then return true end
-            if os.clock() > deadline then
-                Core.log("travel estourou o tempo - pulando bau")
-                return false
-            end
-            local dt = RunSvc.Heartbeat:Wait()
-            local step = math.min(dist, CFG.ChestTravelSpeed * dt)
-            lastSet = cur + delta.Unit * step
-            r.AssemblyLinearVelocity = Vector3.zero
-            r.CFrame = CFrame.new(lastSet)
-        end
-        return false
+        if not r or not isLive(p) then return false end
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.CFrame = p.CFrame
+        return true
     end
 
-    -- fica encostado no bau ate o servidor pagar (ou ate o tempo maximo)
+    -- TP em cima + DELAYZIN colado ate o server contar (Beli sobe) ou o bau sumir.
+    -- segura o CFrame todo frame pra posicao replicar antes de pular pro proximo.
     local function holdUntilPaid(p, before)
         local t0 = os.clock()
         if firetouchinterest then
@@ -563,12 +540,13 @@ do
             if not r or not T.chest then break end
             if p.Parent then
                 r.AssemblyLinearVelocity = Vector3.zero
-                r.CFrame = p.CFrame
+                r.CFrame = p.CFrame          -- cola em cima (o delayzin)
             end
             local now = beli()
             if before and now and now > before then paid = true end
             if not before and not isLive(p) then paid = true end
-            if paid and os.clock() - t0 >= CFG.ChestMinWait then break end
+            -- so sai depois do delayzin minimo, pra garantir que replicou
+            if paid and os.clock() - t0 >= CFG.ChestHold then break end
             RunSvc.Heartbeat:Wait()
         end
         if firetouchinterest then
@@ -599,7 +577,7 @@ do
 
         setNoclip(true)
         local before = beli()
-        local arrived = travelTo(p)
+        local arrived = tpTo(p)
         if arrived and isLive(p) then
             local paid, took = holdUntilPaid(p, before)
             if paid then
@@ -831,8 +809,8 @@ local function buildGui()
     local tune = addTab("Tune")
     mkSlider(tune, "Attack Range", "AttackRange", 100, 600, 10)
     mkSlider(tune, "Attack Interval", "AttackInterval", 0.05, 1, 0.05)
-    mkSlider(tune, "Chest Speed", "ChestTravelSpeed", 60, 300, 10)
-    mkSlider(tune, "Chest Max Wait", "ChestMaxWait", 0.4, 2.5, 0.1)
+    mkSlider(tune, "Chest Hold (delay)", "ChestHold", 0.05, 0.6, 0.01)
+    mkSlider(tune, "Chest Max Wait", "ChestMaxWait", 0.3, 2.0, 0.1)
     mkSlider(tune, "Call Cooldown", "CallCooldown", 0.05, 0.5, 0.01)
 
     -- aba CUSTOM (verbos logados)
