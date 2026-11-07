@@ -53,9 +53,12 @@ local DEFAULTS = {
     -- baus
     ChestTag        = "_ChestTagged",
     ChestNames      = { "Chest1", "Chest2", "Chest3" },
-    ChestStep       = 0.12,     -- base entre baus
-    ChestRetries    = 3,        -- tentativas por bau antes de desistir
-    ChestConfirm    = 0.10,     -- tempo pra confirmar que sumiu
+    ChestTravelSpeed = 150,     -- studs/s indo pro bau (abaixo do limite de kick)
+    ChestMaxWait     = 1.2,     -- maximo parado no bau esperando o servidor contar
+    ChestMinWait     = 0.25,    -- minimo parado no bau (deixa a posicao replicar)
+    ChestMaxFails    = 2,       -- falhas no mesmo bau antes de ignorar ele
+    ChestIgnoreTime  = 45,      -- segundos ignorando bau que falhou
+    ChestNoclip      = true,    -- atravessa parede no caminho
 
     -- geral
     RejoinOnDrop    = true,
@@ -86,6 +89,10 @@ HUB.custom  = HUB.custom or {}   -- { {name=, verb=, args={}} }
 
 local CFG = HUB.config
 local T   = HUB.toggles
+for k, v in pairs(DEFAULTS) do
+    if CFG[k] == nil then CFG[k] = v end
+end
+HUB.stats = HUB.stats or { chests = 0, beli = 0, fails = 0, snaps = 0 }
 
 -- ============================================================
 -- 2. CORE: log, persistencia, utils, character refresh
@@ -108,15 +115,25 @@ do
     local hasFS = (writefile and readfile and isfile) ~= nil
     function Core.save()
         if not hasFS then return end
-        local data = { toggles = T, config = CFG, custom = HUB.custom }
-        pcall(function() writefile(CFG.SaveFile, HttpSvc:JSONEncode(data)) end)
+        local cfgOut = {}
+        for k, v in pairs(CFG) do
+            local t = type(v)
+            if t == "number" or t == "string" or t == "boolean" or t == "table" then cfgOut[k] = v end
+        end
+        local data = { toggles = T, config = cfgOut, custom = HUB.custom }
+        local ok, err = pcall(function() writefile(CFG.SaveFile, HttpSvc:JSONEncode(data)) end)
+        if not ok then print("[BFHUB] save falhou: " .. tostring(err)) end
     end
     function Core.load()
         if not hasFS then return end
         pcall(function()
             if isfile(CFG.SaveFile) then
                 local data = HttpSvc:JSONDecode(readfile(CFG.SaveFile))
-                if data.config then for k, v in pairs(data.config) do CFG[k] = v end end
+                if data.config then
+                    for k, v in pairs(data.config) do
+                        if k ~= "GuiKeybind" then CFG[k] = v end
+                    end
+                end
                 if data.toggles then for k, v in pairs(data.toggles) do T[k] = v end end
                 if data.custom then HUB.custom = data.custom end
                 Core.log("settings carregados do arquivo")
@@ -322,6 +339,7 @@ do
     end
 
     function Feat.farmStep()
+        if Feat.chestBusy then return end
         local es = enemies()
         local tgt = es[1]
         if not tgt or tgt.dist > CFG.AttackRange then return end
@@ -353,57 +371,260 @@ function Feat.statStep()
     end
 end
 
--- ---- 5.6 coletor de bau com retry medido ----
+-- ---- 5.6 coletor de bau v3 ----
+-- Por que o dinheiro nao contava antes:
+--   1) TP instantaneo + sair em 0.12s: o servidor nunca via teu personagem
+--      encostado no bau (a posicao replica com atraso/ping), entao nao pagava.
+--   2) StreamingEnabled: ao teleportar longe, a area ainda nao tinha carregado.
+--      O bau que tu "pegava" era copia velha/descarregada -> nao renderizava.
+--   3) Lista congelada: o loop usava uma foto antiga dos baus, entao ia em
+--      bau que ja tinha sido pego/descarregado.
+-- O que mudou:
+--   - registro AO VIVO de baus (entra quando spawna/carrega, sai quando some)
+--   - so vai em bau VIVO (no workspace, tocavel, visivel, com TouchInterest)
+--   - pede pro jogo carregar a area antes de ir (RequestStreamAroundAsync)
+--   - viaja suave numa velocidade fixa (sem TP gigante), com noclip
+--   - fica no bau ATE O SERVIDOR PAGAR (Beli sobe) ou ate o tempo maximo
+--   - detecta rubberband e diminui a velocidade sozinho
+--   - bau que falha repetido vai pra lista de ignorados por um tempo
 do
-    local function chestList()
-        local r, out = Core.root, {}
-        if not r then return out end
-        local tagged = {}
-        pcall(function() tagged = CS:GetTagged(CFG.ChestTag) end)
-        if #tagged == 0 then
-            for _, name in ipairs(CFG.ChestNames) do
-                for _, d in ipairs(workspace:GetDescendants()) do
-                    if d.Name == name and (d:IsA("BasePart") or d:FindFirstChildWhichIsA("BasePart")) then
-                        table.insert(tagged, d)
-                    end
-                end
-            end
+    local RunSvc = game:GetService("RunService")
+    local live      = {}  -- [touchPart] = chestInstance
+    local fails     = {}  -- [touchPart] = n
+    local ignored   = {}  -- [touchPart] = os.clock() ate quando ignorar
+    local requireTI = true
+    local warnedBeli = false
+
+    local function isChestName(inst)
+        for _, n in ipairs(CFG.ChestNames) do
+            if inst.Name == n then return true end
         end
-        for _, c in ipairs(tagged) do
-            if c.Parent then
-                local part = c:IsA("BasePart") and c or (c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart", true))
-                if part then table.insert(out, { chest = c, part = part,
-                             dist = (part.Position - r.Position).Magnitude }) end
-            end
-        end
-        table.sort(out, function(a, b) return a.dist < b.dist end)
-        return out
+        return false
     end
 
-    -- teleporta, toca, CONFIRMA que sumiu; se nao, espera mais e tenta de novo
-    function Feat.chestStep()
-        local list = chestList()
-        if #list == 0 then task.wait(2); return end
-        for _, e in ipairs(list) do
-            if not T.chest then break end
-            local got = false
-            for attempt = 1, CFG.ChestRetries do
-                local r = Core.root
-                if not r or not e.chest.Parent then got = true; break end
-                r.AssemblyLinearVelocity = Vector3.zero
-                r.CFrame = e.part.CFrame
-                if firetouchinterest then
-                    pcall(function()
-                        firetouchinterest(r, e.part, 0); task.wait()
-                        firetouchinterest(r, e.part, 1)
-                    end)
-                end
-                task.wait(CFG.ChestConfirm * attempt)  -- espera crescente contra rubberband
-                if not e.chest.Parent then got = true; break end
+    local function isChest(inst)
+        local tagged = false
+        pcall(function() tagged = CS:HasTag(inst, CFG.ChestTag) end)
+        return tagged or isChestName(inst)
+    end
+
+    -- a peca que realmente recebe o toque (a que tem TouchInterest)
+    local function touchPart(inst)
+        if inst:IsA("BasePart") and inst:FindFirstChildWhichIsA("TouchTransmitter") then return inst end
+        for _, d in ipairs(inst:GetDescendants()) do
+            if d:IsA("TouchTransmitter") and d.Parent:IsA("BasePart") then return d.Parent end
+        end
+        if inst:IsA("BasePart") then return inst end
+        if inst:IsA("Model") then return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true) end
+    end
+
+    local function isLive(p)
+        if not p or not p.Parent or not p:IsDescendantOf(workspace) then return false end
+        if not p.CanTouch or p.Transparency >= 0.95 then return false end
+        if requireTI and not p:FindFirstChildWhichIsA("TouchTransmitter") then return false end
+        return true
+    end
+
+    local function register(inst)
+        if not isChest(inst) then return end
+        local p = touchPart(inst)
+        if p then live[p] = inst end
+    end
+
+    local function unregister(inst)
+        for p, c in pairs(live) do
+            if p == inst or c == inst or not p:IsDescendantOf(workspace) then
+                live[p] = nil; fails[p] = nil; ignored[p] = nil
             end
-            task.wait(CFG.ChestStep)
         end
     end
+
+    local function fullScan()
+        table.clear(live)
+        pcall(function()
+            for _, c in ipairs(CS:GetTagged(CFG.ChestTag)) do register(c) end
+        end)
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if isChestName(d) then register(d) end
+        end
+        -- se nenhum bau tem TouchInterest visivel, o jogo usa outro esquema:
+        -- relaxa o filtro em vez de ignorar todos
+        local total, withTI = 0, 0
+        for p in pairs(live) do
+            total += 1
+            if p:FindFirstChildWhichIsA("TouchTransmitter") then withTI += 1 end
+        end
+        local was = requireTI
+        requireTI = not (total > 0 and withTI == 0)
+        if was ~= requireTI and not requireTI then
+            Core.log("baus sem TouchInterest visivel - filtro relaxado")
+        end
+        return total
+    end
+
+    -- sinais: bau que spawna/carrega entra na hora, bau que some sai na hora
+    pcall(function()
+        CS:GetInstanceAddedSignal(CFG.ChestTag):Connect(function(i) task.delay(0.2, register, i) end)
+        CS:GetInstanceRemovedSignal(CFG.ChestTag):Connect(unregister)
+    end)
+    workspace.DescendantAdded:Connect(function(d)
+        if isChestName(d) then task.delay(0.2, register, d) end
+    end)
+    workspace.DescendantRemoving:Connect(function(d)
+        if live[d] or isChestName(d) then unregister(d) end
+    end)
+    task.spawn(function()
+        while HUB.alive do
+            task.wait(15)
+            if T.chest then fullScan() end
+        end
+    end)
+
+    local function beli()
+        local data = lp:FindFirstChild("Data")
+        local b = data and data:FindFirstChild("Beli")
+        if b and (b:IsA("IntValue") or b:IsA("NumberValue")) then return b.Value end
+        if not warnedBeli then
+            warnedBeli = true
+            Core.log("sem Data.Beli - confirmando pelo bau sumir (menos preciso)")
+        end
+        return nil
+    end
+
+    local function nextChest()
+        local r = Core.root
+        if not r then return end
+        local now, best, bestD = os.clock(), nil, math.huge
+        for p in pairs(live) do
+            if (not ignored[p] or ignored[p] < now) and isLive(p) then
+                local d = (p.Position - r.Position).Magnitude
+                if d < bestD then best, bestD = p, d end
+            end
+        end
+        return best, bestD
+    end
+
+    -- noclip so enquanto o coletor ta andando
+    local noclipConn
+    local function setNoclip(on)
+        if on and CFG.ChestNoclip and not noclipConn then
+            noclipConn = RunSvc.Stepped:Connect(function()
+                local c = Core.char
+                if not c then return end
+                for _, v in ipairs(c:GetDescendants()) do
+                    if v:IsA("BasePart") and v.CanCollide then v.CanCollide = false end
+                end
+            end)
+        elseif not on and noclipConn then
+            noclipConn:Disconnect(); noclipConn = nil
+        end
+    end
+
+    -- anda ate o alvo numa velocidade fixa, frame a frame.
+    -- se o servidor puxar de volta (rubberband), reduz a velocidade.
+    local function travelTo(p)
+        local r = Core.root
+        if not r then return false end
+        local startDist = (p.Position - r.Position).Magnitude
+        local deadline = os.clock() + startDist / math.max(CFG.ChestTravelSpeed, 30) * 2 + 4
+        local lastSet
+        while T.chest and Core.alive() and isLive(p) do
+            r = Core.root
+            local cur = r.Position
+            if lastSet and (cur - lastSet).Magnitude > 25 then
+                HUB.stats.snaps += 1
+                CFG.ChestTravelSpeed = math.max(60, math.floor(CFG.ChestTravelSpeed * 0.85))
+                Core.log("rubberband - velocidade baixou pra " .. CFG.ChestTravelSpeed)
+            end
+            local delta = p.Position - cur
+            local dist = delta.Magnitude
+            if dist < 3 then return true end
+            if os.clock() > deadline then
+                Core.log("travel estourou o tempo - pulando bau")
+                return false
+            end
+            local dt = RunSvc.Heartbeat:Wait()
+            local step = math.min(dist, CFG.ChestTravelSpeed * dt)
+            lastSet = cur + delta.Unit * step
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.CFrame = CFrame.new(lastSet)
+        end
+        return false
+    end
+
+    -- fica encostado no bau ate o servidor pagar (ou ate o tempo maximo)
+    local function holdUntilPaid(p, before)
+        local t0 = os.clock()
+        if firetouchinterest then
+            pcall(function() firetouchinterest(Core.root, p, 0) end)
+        end
+        local paid = false
+        while os.clock() - t0 < CFG.ChestMaxWait do
+            local r = Core.root
+            if not r or not T.chest then break end
+            if p.Parent then
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = p.CFrame
+            end
+            local now = beli()
+            if before and now and now > before then paid = true end
+            if not before and not isLive(p) then paid = true end
+            if paid and os.clock() - t0 >= CFG.ChestMinWait then break end
+            RunSvc.Heartbeat:Wait()
+        end
+        if firetouchinterest then
+            pcall(function() firetouchinterest(Core.root, p, 1) end)
+        end
+        return paid, os.clock() - t0
+    end
+
+    function Feat.chestStop()
+        Feat.chestBusy = false
+        setNoclip(false)
+    end
+
+    function Feat.chestStep()
+        if next(live) == nil and fullScan() == 0 then
+            task.wait(3)
+            return
+        end
+        local p = nextChest()
+        if not p then task.wait(1); return end
+
+        Feat.chestBusy = true
+        -- carrega a area antes (StreamingEnabled): evita bau "fantasma"
+        if workspace.StreamingEnabled then
+            pcall(function() lp:RequestStreamAroundAsync(p.Position, 2) end)
+        end
+        if not isLive(p) then Feat.chestBusy = false; return end
+
+        setNoclip(true)
+        local before = beli()
+        local arrived = travelTo(p)
+        if arrived and isLive(p) then
+            local paid, took = holdUntilPaid(p, before)
+            if paid then
+                local gain = (before and beli()) and (beli() - before) or 0
+                HUB.stats.chests += 1
+                HUB.stats.beli += gain
+                fails[p] = nil
+                Core.log(("bau ok +%d beli (%.2fs) | total %d baus, %d beli")
+                    :format(math.floor(gain), took, HUB.stats.chests, math.floor(HUB.stats.beli)))
+            else
+                HUB.stats.fails += 1
+                fails[p] = (fails[p] or 0) + 1
+                Core.log("servidor nao contou esse bau (" .. fails[p] .. "x)")
+                if fails[p] >= CFG.ChestMaxFails then
+                    ignored[p] = os.clock() + CFG.ChestIgnoreTime
+                    fails[p] = nil
+                    Core.log("ignorando esse bau por " .. CFG.ChestIgnoreTime .. "s")
+                end
+            end
+        end
+        Feat.chestBusy = false
+    end
+
+    fullScan()
 end
 
 -- ---- 5.7 verbo customizado (CDK/Soul/Halloween apos logar) ----
@@ -431,7 +652,17 @@ end)
 
 task.spawn(function()
     while HUB.alive do
-        if T.chest and Core.alive() then pcall(Feat.chestStep) else task.wait(0.5) end
+        if T.chest and Core.alive() then
+            local ok, err = pcall(Feat.chestStep)
+            if not ok then
+                Feat.chestBusy = false
+                Core.log("erro no bau: " .. tostring(err))
+                task.wait(1)
+            end
+        else
+            if Feat.chestStop then Feat.chestStop() end
+            task.wait(0.5)
+        end
     end
 end)
 
@@ -601,7 +832,8 @@ local function buildGui()
     local tune = addTab("Tune")
     mkSlider(tune, "Attack Range", "AttackRange", 100, 600, 10)
     mkSlider(tune, "Attack Interval", "AttackInterval", 0.05, 1, 0.05)
-    mkSlider(tune, "Chest Step", "ChestStep", 0.05, 0.6, 0.01)
+    mkSlider(tune, "Chest Speed", "ChestTravelSpeed", 60, 300, 10)
+    mkSlider(tune, "Chest Max Wait", "ChestMaxWait", 0.4, 2.5, 0.1)
     mkSlider(tune, "Call Cooldown", "CallCooldown", 0.05, 0.5, 0.01)
 
     -- aba CUSTOM (verbos logados)
