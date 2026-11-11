@@ -79,14 +79,34 @@ local UIS     = game:GetService("UserInputService")
 local HttpSvc = game:GetService("HttpService")
 local lp      = Players.LocalPlayer
 
-getgenv().BFHUB = getgenv().BFHUB or {}
+-- re-execucao: derruba a instancia anterior antes de subir a nova
+-- (sem isso: dois loops de bau brigando, duas GUIs, log congelado)
+do
+    local prev = rawget(getgenv(), "BFHUB")
+    if type(prev) == "table" then
+        prev.alive = false
+        if prev._gui then pcall(function() prev._gui:Destroy() end) end
+    end
+    local hosts = {}
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and h then table.insert(hosts, h) end
+    end
+    local pg = lp:FindFirstChild("PlayerGui")
+    if pg then table.insert(hosts, pg) end
+    for _, host in ipairs(hosts) do
+        local stale = host:FindFirstChild("BFHUB_PRO")
+        if stale then pcall(function() stale:Destroy() end) end
+    end
+    if type(prev) == "table" then task.wait(0.35) end
+end
+
+getgenv().BFHUB = {}
 local HUB = getgenv().BFHUB
 HUB.alive = true
-HUB.toggles = HUB.toggles or {
-    farm = false, quest = false, chest = false, stat = false, idle = true,
-}
-HUB.config  = HUB.config or table.clone(DEFAULTS)
-HUB.custom  = HUB.custom or {}   -- { {name=, verb=, args={}} }
+HUB.toggles = { farm = false, quest = false, chest = false, stat = false, idle = true }
+HUB.config  = table.clone(DEFAULTS)
+HUB.custom  = {}   -- { {name=, verb=, args={}} }
 
 local CFG = HUB.config
 local T   = HUB.toggles
@@ -105,8 +125,8 @@ do
     Core.logLines = {}
     Core.logHook  = nil
     function Core.log(msg)
-        msg = "[" .. os.date("%H:%M:%S") .. "] " .. tostring(msg)
-        table.insert(Core.logLines, msg)
+        msg = tostring(msg)
+        table.insert(Core.logLines, "[" .. os.date("%H:%M:%S") .. "] " .. msg)
         if #Core.logLines > 80 then table.remove(Core.logLines, 1) end
         print("[BFHUB] " .. msg)
         if Core.logHook then pcall(Core.logHook) end
@@ -121,7 +141,7 @@ do
             local t = type(v)
             if t == "number" or t == "string" or t == "boolean" or t == "table" then cfgOut[k] = v end
         end
-        local data = { toggles = T, config = cfgOut, custom = HUB.custom }
+        local data = { toggles = T, config = cfgOut, custom = HUB.custom, stats = HUB.stats }
         local ok, err = pcall(function() writefile(CFG.SaveFile, HttpSvc:JSONEncode(data)) end)
         if not ok then print("[BFHUB] save falhou: " .. tostring(err)) end
     end
@@ -137,6 +157,12 @@ do
                 end
                 if data.toggles then for k, v in pairs(data.toggles) do T[k] = v end end
                 if data.custom then HUB.custom = data.custom end
+                if data.stats then
+                    HUB.stats = HUB.stats or {}
+                    for k, v in pairs(data.stats) do
+                        if type(v) == "number" then HUB.stats[k] = v end
+                    end
+                end
                 Core.log("settings carregados do arquivo")
             end
         end)
@@ -144,10 +170,34 @@ do
 
     -- character refs com refresh automatico
     Core.char, Core.root, Core.hum = nil, nil, nil
+    local bindGen = 0
     local function bind(c)
-        Core.char = c
-        Core.root = c:WaitForChild("HumanoidRootPart", 10)
-        Core.hum  = c:WaitForChild("Humanoid", 10)
+        bindGen += 1
+        local myGen = bindGen
+        local root = c:WaitForChild("HumanoidRootPart", 10)
+        local hum  = c:WaitForChild("Humanoid", 10)
+        if myGen ~= bindGen then return end  -- respawnou de novo no meio: aborta
+        if not root or not hum then
+            -- timeout (ping alto/streaming): nao morre mudo NEM espera outra
+            -- morte - loga e re-tenta em background ate o char completar
+            Core.log("bind: root/hum nao chegaram em 10s - re-tentando em background")
+            task.spawn(function()
+                while myGen == bindGen and c.Parent do
+                    root = root or c:FindFirstChild("HumanoidRootPart")
+                    hum  = hum  or c:FindFirstChildWhichIsA("Humanoid")
+                    if root and hum then
+                        if myGen == bindGen then
+                            Core.char, Core.root, Core.hum = c, root, hum
+                            Core.log("bind: recuperado")
+                        end
+                        return
+                    end
+                    task.wait(1)
+                end
+            end)
+            return
+        end
+        Core.char, Core.root, Core.hum = c, root, hum
     end
     if lp.Character then bind(lp.Character) end
     lp.CharacterAdded:Connect(bind)
@@ -202,7 +252,8 @@ do
     -- invoca CommF_ com pacing, pcall e watchdog (re-resolve se falhar demais)
     function Net.commf(verb, ...)
         if not Net.R.CommF then
-            if #Net.resolve() > 0 then return false, "sem CommF_" end
+            Net.resolve()
+            if not Net.R.CommF then return false, "sem CommF_" end
         end
         Core.pace()
         local args = table.pack(...)
@@ -354,11 +405,23 @@ do
 end
 
 -- ---- 5.4 auto-quest ----
+local questMiss = 0
 function Feat.questStep()
     if CFG.QuestGiverId == "" then return end
     local gui = lp:FindFirstChild("PlayerGui")
-    local tracker = gui and gui:FindFirstChild("Main") and gui.Main:FindFirstChild("Quest")
-    if not (tracker and tracker.Visible) then
+    local main = gui and gui:FindFirstChild("Main")
+    local tracker = main and main:FindFirstChild("Quest")
+    if not tracker then
+        -- caminho Main.Quest nao existe (update renomeou?): nao spamma StartQuest
+        questMiss += 1
+        if questMiss == 10 then
+            Core.log("tracker Main.Quest nao achado - auto-quest DESLIGADO (update?)")
+            T.quest = false
+        end
+        return
+    end
+    questMiss = 0
+    if not tracker.Visible then
         Net.commf("StartQuest", CFG.QuestGiverId, CFG.QuestIndex)
     end
 end
@@ -367,7 +430,8 @@ end
 function Feat.statStep()
     for label, weight in pairs(CFG.StatPlan) do
         if weight and weight > 0 then
-            Net.commf("AddPoint", label, CFG.StatPerTick * weight)
+            local pts = math.floor(CFG.StatPerTick * weight + 0.5)
+            if pts > 0 then Net.commf("AddPoint", label, pts) end
         end
     end
 end
@@ -435,15 +499,26 @@ do
     end
 
     local function unregister(inst)
+        local dead = {}
         for p, c in pairs(live) do
             if p == inst or c == inst or not p:IsDescendantOf(workspace) then
-                live[p] = nil; fails[p] = nil; ignored[p] = nil
+                table.insert(dead, p)
             end
+        end
+        for _, p in ipairs(dead) do
+            live[p] = nil; fails[p] = nil; ignored[p] = nil
         end
     end
 
     local function fullScan()
         table.clear(live)
+        -- GC: solta referencias a baus ja destruidos (leak em sessao longa)
+        for part in pairs(fails) do
+            if not part:IsDescendantOf(workspace) then fails[part] = nil end
+        end
+        for part in pairs(ignored) do
+            if not part:IsDescendantOf(workspace) then ignored[part] = nil end
+        end
         pcall(function()
             for _, c in ipairs(CS:GetTagged(CFG.ChestTag)) do register(c) end
         end)
@@ -480,13 +555,37 @@ do
         end
     end)
 
+    -- acha o valor de dinheiro sozinho: tenta Data.Beli, senao procura
+    -- qualquer Int/NumberValue com "beli"/"money"/"cash" no nome dentro
+    -- do player. cacheia quando acha.
+    local beliObj
+    local beliSearchAt = -math.huge
     local function beli()
+        if beliObj and beliObj.Parent then return beliObj.Value end
+        if beliObj then
+            beliObj = nil
+            beliSearchAt = -math.huge   -- cache morreu: re-busca JA (senao perde o pagamento)
+        end
+        if os.clock() - beliSearchAt < 2 then return nil end
+        beliSearchAt = os.clock()
         local data = lp:FindFirstChild("Data")
         local b = data and data:FindFirstChild("Beli")
-        if b and (b:IsA("IntValue") or b:IsA("NumberValue")) then return b.Value end
+        if not b then
+            for _, d in ipairs(lp:GetDescendants()) do
+                if (d:IsA("IntValue") or d:IsA("NumberValue")) then
+                    local n = d.Name:lower()
+                    if n:find("beli") or n == "money" or n == "cash" then b = d break end
+                end
+            end
+        end
+        if b and (b:IsA("IntValue") or b:IsA("NumberValue")) then
+            beliObj = b
+            Core.log("moeda encontrada: " .. b:GetFullName())
+            return b.Value
+        end
         if not warnedBeli then
             warnedBeli = true
-            Core.log("sem Data.Beli - confirmando pelo bau sumir (menos preciso)")
+            Core.log("sem valor de moeda achavel - confirmando pelo bau sumir (menos preciso)")
         end
         return nil
     end
@@ -504,19 +603,36 @@ do
         return best, bestD
     end
 
-    -- noclip so enquanto o coletor ta andando
+    -- noclip enquanto o coletor estiver coletando (teleporte por CFrame nao
+    -- precisa de colisao; evita travar em hitbox no caminho).
+    -- nota: o Humanoid re-liga CanCollide do CORPO todo frame (por isso
+    -- noclip e um loop) - ao desligar, o motor restaura o corpo sozinho.
+    -- originalCollide cobre o que o Humanoid NAO gerencia (ex: Handle de
+    -- tool), e o guard de HUB.alive mata loop orfao em re-execucao.
     local noclipConn
+    local originalCollide = {}
+    local function noclipOff()
+        if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
+        for part in pairs(originalCollide) do
+            if part and part.Parent then pcall(function() part.CanCollide = true end) end
+        end
+        table.clear(originalCollide)
+    end
     local function setNoclip(on)
         if on and CFG.ChestNoclip and not noclipConn then
             noclipConn = RunSvc.Stepped:Connect(function()
+                if not HUB.alive then noclipOff(); return end
                 local c = Core.char
                 if not c then return end
                 for _, v in ipairs(c:GetDescendants()) do
-                    if v:IsA("BasePart") and v.CanCollide then v.CanCollide = false end
+                    if v:IsA("BasePart") and v.CanCollide then
+                        if originalCollide[v] == nil then originalCollide[v] = true end
+                        v.CanCollide = false
+                    end
                 end
             end)
         elseif not on and noclipConn then
-            noclipConn:Disconnect(); noclipConn = nil
+            noclipOff()
         end
     end
 
@@ -538,6 +654,7 @@ do
         end
         local paid = false
         while os.clock() - t0 < CFG.ChestMaxWait do
+            if not HUB.alive then break end   -- re-execucao: instancia velha solta o char
             local r = Core.root
             if not r or not T.chest then break end
             if p.Parent then
@@ -569,6 +686,7 @@ do
         pcall(function() lp:RequestStreamAroundAsync(pos, CFG.ChestStreamWait) end)
         -- 2) confirma: a parte do bau precisa existir E ter chao embaixo
         while os.clock() - t0 < CFG.ChestStreamWait do
+            if not HUB.alive then return false end   -- re-execucao: para de puxar o char
             if not T.chest or not Core.alive() then return false end
             local r = Core.root
             if r then r.CFrame = p.Parent and p.CFrame or CFrame.new(pos) end
@@ -577,7 +695,10 @@ do
                 -- raycast curto pra baixo: se bateu em algo, o terreno carregou
                 local rp = RaycastParams.new()
                 rp.FilterType = Enum.RaycastFilterType.Exclude
-                rp.FilterDescendantsInstances = { Core.char }
+                -- exclui o proprio bau: senao o ray bate NELE e da falso "carregou"
+                local filt = { p }
+                if Core.char then table.insert(filt, Core.char) end
+                rp.FilterDescendantsInstances = filt
                 local hit = workspace:Raycast(pos + Vector3.new(0,6,0), Vector3.new(0,-40,0), rp)
                 if hit then ok = true; break end
             end
@@ -616,28 +737,42 @@ do
             arrived = streamWait(p)
         end
 
+        local collected = false
+        local target = p   -- se assumir o "fresh" e falhar, a falha conta nele
         if arrived and isLive(p) then
             -- reancora: apos carregar, a instancia do bau pode ter sido recriada
             local fresh = nextChest()
-            if fresh and (fresh.Position - p.Position).Magnitude < 8 then p = fresh end
-            tpTo(p)
-            local paid, took = holdUntilPaid(p, before)
-            if paid then
-                local gain = (before and beli()) and (beli() - before) or 0
-                HUB.stats.chests += 1
-                HUB.stats.beli += gain
-                fails[p] = nil
-                Core.log(("bau ok +%d beli (%.2fs) | total %d baus, %d beli")
-                    :format(math.floor(gain), took, HUB.stats.chests, math.floor(HUB.stats.beli)))
-            else
-                HUB.stats.fails += 1
-                fails[p] = (fails[p] or 0) + 1
-                Core.log("servidor nao contou esse bau (" .. fails[p] .. "x)")
-                if fails[p] >= CFG.ChestMaxFails then
-                    ignored[p] = os.clock() + CFG.ChestIgnoreTime
-                    fails[p] = nil
-                    Core.log("ignorando esse bau por " .. CFG.ChestIgnoreTime .. "s")
+            if fresh and (fresh.Position - p.Position).Magnitude < 8 then target = fresh end
+            if tpTo(target) then
+                local paid, took = holdUntilPaid(target, before)
+                if paid then
+                    collected = true
+                    local nowBeli = beli()
+                    local gain = (before and nowBeli) and (nowBeli - before) or 0
+                    HUB.stats.chests += 1
+                    HUB.stats.beli += gain
+                    fails[target] = nil
+                    if before then
+                        Core.log(("bau ok +%d beli (%.2fs) | total %d baus, %d beli")
+                            :format(math.floor(gain), took, HUB.stats.chests, math.floor(HUB.stats.beli)))
+                    else
+                        Core.log(("bau ok (%.2fs, sem leitor de moeda) | total %d baus")
+                            :format(took, HUB.stats.chests))
+                    end
                 end
+            end
+        end
+        -- QUALQUER falha (stream nao renderizou, tp falhou, server nao pagou)
+        -- conta como falha do bau -> ignora apos N. sem isso, bau cuja regiao
+        -- nunca streama trava o coletor em loop infinito nele (#9/#10)
+        if not collected and T.chest then
+            HUB.stats.fails += 1
+            fails[target] = (fails[target] or 0) + 1
+            Core.log("bau nao contou (" .. fails[target] .. "x)")
+            if fails[target] >= CFG.ChestMaxFails then
+                ignored[target] = os.clock() + CFG.ChestIgnoreTime
+                fails[target] = nil
+                Core.log("ignorando esse bau por " .. CFG.ChestIgnoreTime .. "s")
             end
         end
         Feat.chestBusy = false
@@ -674,7 +809,7 @@ task.spawn(function()
         if T.chest and Core.alive() then
             local ok, err = pcall(Feat.chestStep)
             if not ok then
-                Feat.chestBusy = false
+                pcall(Feat.chestStop)   -- solta busy E noclip
                 Core.log("erro no bau: " .. tostring(err))
                 task.wait(1)
             end
@@ -682,6 +817,14 @@ task.spawn(function()
             if Feat.chestStop then Feat.chestStop() end
             task.wait(0.5)
         end
+    end
+end)
+
+-- autosave: 1 writefile por minuto enquanto farma (stats persistem sem spam)
+task.spawn(function()
+    while HUB.alive do
+        task.wait(60)
+        if T.chest or T.farm then Core.save() end
     end
 end)
 
@@ -697,7 +840,13 @@ local function buildGui()
     local sg = Instance.new("ScreenGui")
     sg.Name = "BFHUB_PRO"; sg.ResetOnSpawn = false; sg.IgnoreGuiInset = true
     sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sg.Parent = (gethui and gethui()) or lp:WaitForChild("PlayerGui")
+    local host = lp:WaitForChild("PlayerGui")
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and h then host = h end
+    end
+    sg.Parent = host
+    HUB._gui = sg
 
     local win = Instance.new("Frame", sg)
     win.Size = UDim2.fromOffset(250, 300)
@@ -809,12 +958,12 @@ local function buildGui()
             fill.Size = UDim2.fromScale(math.clamp((v-min)/(max-min),0,1), 1)
         end
         render()
-        local dragging
+        local dragging, dirty
         local function setFromX(px)
             local rel = math.clamp((px - bar.AbsolutePosition.X)/bar.AbsoluteSize.X, 0, 1)
             local v = min + rel*(max-min)
             v = math.floor(v/step + 0.5)*step
-            CFG[cfgKey] = v; render(); Core.save()
+            CFG[cfgKey] = v; render(); dirty = true
         end
         bar.InputBegan:Connect(function(i)
             if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
@@ -827,7 +976,10 @@ local function buildGui()
             end
         end)
         UIS.InputEnded:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end
+            if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
+                if dragging and dirty then Core.save(); dirty = false end
+                dragging = false
+            end
         end)
     end
 
@@ -893,10 +1045,12 @@ local function buildGui()
         end)
         smallBtn("Save", function()
             local v = box.Text:gsub('["\']','')
-            if v ~= "" then
-                table.insert(HUB.custom, { name = v, verb = v })
-                addCustomBtn(v, v); Core.save()
+            if v == "" then return end
+            for _, c in ipairs(HUB.custom) do
+                if c.verb == v then return end   -- ja existe, nao duplica
             end
+            table.insert(HUB.custom, { name = v, verb = v })
+            addCustomBtn(v, v); Core.save()
         end)
     end
 
