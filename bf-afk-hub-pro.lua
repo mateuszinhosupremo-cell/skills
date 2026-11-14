@@ -60,6 +60,15 @@ local DEFAULTS = {
     ChestNoclip      = true,    -- atravessa parede no caminho
     ChestStreamWait  = 2.0,     -- teto esperando a area RENDERIZAR apos o TP (streaming)
     ChestSettle      = 0.12,    -- respiro extra depois que carregou, antes de tocar
+    ChestDisabledAttr = "IsDisabled", -- atributo que marca bau ja pego (nao renasceu ainda)
+    ChestFarDist     = 200,     -- TP FINAL: voa ate ficar a essa distancia do bau e ai da TP instantaneo
+    ChestFarMode     = 2,       -- bau longe: 1 = tp instantaneo | 2 = voo (o server aceita)
+    ChestFlySpeed    = 300,     -- studs/s do voo ate bau longe (~300 e o que a comunidade usa)
+    ChestFlyUp       = 40,      -- voa essa altura acima do bau (fora da agua e das paredes)
+    ChestFarWait     = 2.0,     -- teto de espera no bau longe
+    ChestPreTouch    = 0.25,    -- bau longe: fica parado isso ANTES do 1o toque
+    ChestRetouch     = 0.35,    -- re-toca nesse intervalo enquanto espera pagar
+    ChestFailPause   = 6,       -- tantos baus seguidos sem pagar = pausa de 30s
 
     -- barco (levantar / velocidade / auto leviathan)
     BoatFolder      = "Boats",   -- pasta dos barcos no workspace (fallback: o modelo do assento)
@@ -73,8 +82,9 @@ local DEFAULTS = {
     LeviOutDist     = 5000,      -- quanto anda reto na direcao do barco antes de patrulhar
     LeviLeg         = 2500,      -- tamanho de cada perna da patrulha (quadrado)
     -- o que conta como "a dimensao apareceu" (nomes mudam por update: confere no Explorer)
-    LeviSigns       = { "Frozen Dimension", "Leviathan" },
-    LeviContainers  = { "_WorldOrigin/Locations", "Map", "SeaBeasts" },
+    LeviSigns       = { "LeviathanGate", "Frozen Dimension", "Leviathan" },
+    LeviContainers  = { "Map", "SeaBeasts", "_WorldOrigin/Locations" },
+    LeviDirMode     = 2,         -- 1 = frente do barco | 2 = pra longe das ilhas (perigo cresce com a distancia)
 
     -- geral
     RejoinOnDrop    = true,
@@ -475,6 +485,7 @@ do
     local live      = {}  -- [touchPart] = chestInstance
     local fails     = {}  -- [touchPart] = n
     local ignored   = {}  -- [touchPart] = os.clock() ate quando ignorar
+    local strikes   = {}  -- [touchPart] = quantas vezes ja foi ignorado (ignora cada vez mais)
     local requireTI = false
     local warnedBeli = false
 
@@ -501,9 +512,24 @@ do
         if inst:IsA("Model") then return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true) end
     end
 
+    -- bau desativado = ja foi pego e ainda nao renasceu. o jogo NAO destroi o
+    -- bau coletado, so marca o atributo; tocar nele nunca paga.
+    local function isDisabled(p)
+        local attr = CFG.ChestDisabledAttr
+        if type(attr) ~= "string" or attr == "" then return false end
+        local holder = live[p]
+        local ok, v = pcall(function()
+            if p:GetAttribute(attr) then return true end
+            if holder ~= nil and holder ~= p and holder:GetAttribute(attr) then return true end
+            return false
+        end)
+        return ok and v == true
+    end
+
     local function isLive(p)
         if not p or not p.Parent or not p:IsDescendantOf(workspace) then return false end
         if not p.CanTouch then return false end
+        if isDisabled(p) then return false end
         -- visivel OU tem TouchInterest (BF tem baus solidos sem TT ate encostar)
         if p.Transparency >= 0.95 and not p:FindFirstChildWhichIsA("TouchTransmitter") then return false end
         if requireTI and not p:FindFirstChildWhichIsA("TouchTransmitter") then return false end
@@ -524,7 +550,7 @@ do
             end
         end
         for _, p in ipairs(dead) do
-            live[p] = nil; fails[p] = nil; ignored[p] = nil
+            live[p] = nil; fails[p] = nil; ignored[p] = nil; strikes[p] = nil
         end
     end
 
@@ -536,6 +562,9 @@ do
         end
         for part in pairs(ignored) do
             if not part:IsDescendantOf(workspace) then ignored[part] = nil end
+        end
+        for part in pairs(strikes) do
+            if not part:IsDescendantOf(workspace) then strikes[part] = nil end
         end
         pcall(function()
             for _, c in ipairs(CS:GetTagged(CFG.ChestTag)) do register(c) end
@@ -663,33 +692,81 @@ do
         return true
     end
 
-    -- TP em cima + DELAYZIN colado ate o server contar (Beli sobe) ou o bau sumir.
-    -- segura o CFrame todo frame pra posicao replicar antes de pular pro proximo.
-    local function holdUntilPaid(p, before)
-        local t0 = os.clock()
-        if firetouchinterest then
-            pcall(function() firetouchinterest(Core.root, p, 0) end)
+    -- VOO pra bau longe: anda ate la numa velocidade fixa em vez de pular.
+    -- Motivo (visto no log real): salto de ilha pra ilha num frame so o server
+    -- NAO aceita - o personagem dele continua na ilha antiga, a animacao do
+    -- bau toca so no teu celular e nenhum bau paga. Andando rapido ele aceita.
+    local function flyTo(p)
+        local r = Core.root
+        if not r or not isLive(p) then return false end
+        local cruiseY = math.max(r.Position.Y, p.Position.Y) + CFG.ChestFlyUp
+        local deadline = os.clock() + 120
+        while T.chest and HUB.alive and Core.alive() and isLive(p) do
+            local dt = RunSvc.Heartbeat:Wait()
+            r = Core.root
+            if not r then return false end
+            if os.clock() > deadline then
+                Core.log("voo estourou o tempo - pulando bau")
+                return false
+            end
+            local pos, goal = r.Position, p.Position
+            local flat = Vector3.new(goal.X - pos.X, 0, goal.Z - pos.Z).Magnitude
+            -- chegou na distancia do TP final: o resto do caminho e instantaneo
+            if (goal - pos).Magnitude <= math.max(CFG.ChestFarDist, 4) then return tpTo(p) end
+            if flat < 4 and math.abs(goal.Y - pos.Y) < 4 then return tpTo(p) end
+            -- longe: mira no ponto alto acima do bau; chegando: desce nele
+            local aim = (flat > 25) and Vector3.new(goal.X, cruiseY, goal.Z) or goal
+            local delta = aim - pos
+            local dist = delta.Magnitude
+            if dist > 0.01 then
+                local stepLen = math.min(dist, CFG.ChestFlySpeed * dt)
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = CFrame.new(pos + delta.Unit * stepLen)
+            end
         end
-        local paid = false
-        while os.clock() - t0 < CFG.ChestMaxWait do
+        return false
+    end
+
+    -- Fica colado no bau ate o server pagar (Beli sobe) ou estourar maxWait.
+    --  - preTouch: tempo parado ANTES do primeiro toque (o server precisa me
+    --    ver ali antes; toque cedo demais se perde)
+    --  - re-toca a cada ChestRetouch (um toque so nao da segunda chance)
+    --  - devolve tambem o quanto o server me puxou (rubberband) durante a espera
+    local function holdUntilPaid(p, before, maxWait, preTouch)
+        local t0 = os.clock()
+        local touching, lastTouch = false, -math.huge
+        local paid, maxDev = false, 0
+        local function touch(state)
+            if firetouchinterest then
+                pcall(function() firetouchinterest(Core.root, p, state) end)
+            end
+        end
+        while os.clock() - t0 < maxWait do
             if not HUB.alive then break end   -- re-execucao: instancia velha solta o char
             local r = Core.root
             if not r or not T.chest then break end
+            local el = os.clock() - t0
             if p.Parent then
+                local dev = (r.Position - p.Position).Magnitude
+                if dev > maxDev then maxDev = dev end
                 r.AssemblyLinearVelocity = Vector3.zero
                 r.CFrame = p.CFrame          -- cola em cima (o delayzin)
+            end
+            if el >= preTouch and os.clock() - lastTouch >= CFG.ChestRetouch then
+                if touching then touch(1) end
+                touch(0)
+                touching = true
+                lastTouch = os.clock()
             end
             local now = beli()
             if before and now and now > before then paid = true end
             if not before and not isLive(p) then paid = true end
             -- so sai depois do delayzin minimo, pra garantir que replicou
-            if paid and os.clock() - t0 >= CFG.ChestHold then break end
+            if paid and el >= CFG.ChestHold then break end
             RunSvc.Heartbeat:Wait()
         end
-        if firetouchinterest then
-            pcall(function() firetouchinterest(Core.root, p, 1) end)
-        end
-        return paid, os.clock() - t0
+        if touching then touch(1) end
+        return paid, os.clock() - t0, maxDev
     end
 
     -- TP pra regiao do bau e espera ela CARREGAR (renderizar) antes de tocar.
@@ -732,47 +809,85 @@ do
         setNoclip(false)
     end
 
+    -- resumo curto do bau pro log de falha (nome, pasta e atributos)
+    local function describe(p)
+        local bits = {}
+        pcall(function()
+            table.insert(bits, p.Name .. "@" .. (p.Parent and p.Parent.Name or "?"))
+            local n = 0
+            local function addAttrs(inst)
+                for k, v in pairs(inst:GetAttributes()) do
+                    n += 1
+                    if n <= 6 then table.insert(bits, tostring(k) .. "=" .. tostring(v)) end
+                end
+            end
+            addAttrs(p)
+            local holder = live[p]
+            if holder and holder ~= p then addAttrs(holder) end
+            if n == 0 then table.insert(bits, "sem atributos") end
+        end)
+        return table.concat(bits, " ")
+    end
+
+    local failStreak, pauseUntil = 0, 0
+
     function Feat.chestStep()
+        if os.clock() < pauseUntil then
+            setNoclip(false)
+            task.wait(0.5)
+            return
+        end
         if next(live) == nil and fullScan() == 0 then
             task.wait(3)
             return
         end
-        local p = nextChest()
+        local p, jump = nextChest()
         if not p then task.wait(1); return end
+        jump = jump or 0
 
         Feat.chestBusy = true
         setNoclip(true)
         local before = beli()
+        local far = jump > CFG.ChestFarDist
+        -- tamanho do pulo instantaneo que o server vai julgar
+        local hop = (far and CFG.ChestFarMode == 2) and math.min(jump, CFG.ChestFarDist) or jump
 
-        -- 1) TP pra cima do bau (leva teu personagem pra regiao)
-        local arrived = tpTo(p)
-
-        -- 2) ESPERA a area renderizar de verdade antes de tocar.
-        --    e isso que resolve o "so conta depois do nome da cidade aparecer":
-        --    o nome aparece quando a regiao terminou de carregar. aqui a gente
-        --    espera o mesmo evento em vez de tocar num bau meio-carregado.
+        -- 1) chegar. perto: TP instantaneo. longe: voo (ou TP, se voce trocar na aba Tune)
+        local arrived
+        if far and CFG.ChestFarMode == 2 then
+            arrived = flyTo(p)
+        else
+            arrived = tpTo(p)
+        end
         if arrived and workspace.StreamingEnabled then
             arrived = streamWait(p)
         end
 
+        -- 2) colar no bau e esperar o server pagar
         local collected = false
         local target = p   -- se assumir o "fresh" e falhar, a falha conta nele
+        local took, dev = 0, 0
         if arrived and isLive(p) then
-            -- reancora: apos carregar, a instancia do bau pode ter sido recriada
             local fresh = nextChest()
             if fresh and (fresh.Position - p.Position).Magnitude < 8 then target = fresh end
             if tpTo(target) then
-                local paid, took = holdUntilPaid(target, before)
+                local paid
+                paid, took, dev = holdUntilPaid(target, before,
+                    far and CFG.ChestFarWait or CFG.ChestMaxWait,
+                    far and CFG.ChestPreTouch or 0)
                 if paid then
                     collected = true
+                    failStreak = 0
                     local nowBeli = beli()
                     local gain = (before and nowBeli) and (nowBeli - before) or 0
                     HUB.stats.chests += 1
                     HUB.stats.beli += gain
                     fails[target] = nil
+                    strikes[target] = nil
                     if before then
-                        Core.log(("bau ok +%d beli (%.2fs) | total %d baus, %d beli")
-                            :format(math.floor(gain), took, HUB.stats.chests, math.floor(HUB.stats.beli)))
+                        Core.log(("bau ok +%d beli (%.2fs, viagem %d, tp %d) | total %d baus, %d beli")
+                            :format(math.floor(gain), took, math.floor(jump), math.floor(hop),
+                                    HUB.stats.chests, math.floor(HUB.stats.beli)))
                     else
                         Core.log(("bau ok (%.2fs, sem leitor de moeda) | total %d baus")
                             :format(took, HUB.stats.chests))
@@ -780,17 +895,32 @@ do
                 end
             end
         end
-        -- QUALQUER falha (stream nao renderizou, tp falhou, server nao pagou)
-        -- conta como falha do bau -> ignora apos N. sem isso, bau cuja regiao
-        -- nunca streama trava o coletor em loop infinito nele (#9/#10)
-        if not collected and T.chest then
-            HUB.stats.fails += 1
-            fails[target] = (fails[target] or 0) + 1
-            Core.log("bau nao contou (" .. fails[target] .. "x)")
-            if fails[target] >= CFG.ChestMaxFails then
-                ignored[target] = os.clock() + CFG.ChestIgnoreTime
-                fails[target] = nil
-                Core.log("ignorando esse bau por " .. CFG.ChestIgnoreTime .. "s")
+
+        -- 3) nao pagou
+        if not collected and T.chest and HUB.alive then
+            if took > 0 or isLive(target) then
+                HUB.stats.fails += 1
+                failStreak += 1
+                fails[target] = (fails[target] or 0) + 1
+                Core.log(("bau nao contou (%dx) viagem %d tp %d | esperei %.1fs | puxado %d | %s")
+                    :format(fails[target], math.floor(jump), math.floor(hop), took,
+                            math.floor(dev), describe(target)))
+                if fails[target] >= CFG.ChestMaxFails then
+                    strikes[target] = (strikes[target] or 0) + 1
+                    -- cada vez que o mesmo bau falha de novo, fica mais tempo de fora
+                    local t = math.min(CFG.ChestIgnoreTime * 4 ^ (strikes[target] - 1), 900)
+                    ignored[target] = os.clock() + t
+                    fails[target] = nil
+                    Core.log("ignorando esse bau por " .. math.floor(t) .. "s")
+                end
+            else
+                Core.log("bau sumiu antes de eu chegar (alguem pegou) - proximo")
+            end
+            -- insistir em toque que o server recusa e o que acumula pro Security Kick
+            if failStreak >= CFG.ChestFailPause then
+                failStreak = 0
+                pauseUntil = os.clock() + 30
+                Core.log(CFG.ChestFailPause .. " baus seguidos sem pagar - pausa de 30s (me manda esse log)")
             end
         end
         Feat.chestBusy = false
@@ -799,16 +929,17 @@ do
     -- numeros pro diagnostico: achados, vivos, com TouchInterest, por tag, moeda
     function Feat.chestInfo()
         fullScan()
-        local total, alive, withTI = 0, 0, 0
+        local total, alive, withTI, off = 0, 0, 0, 0
         for part in pairs(live) do
             total += 1
             if part:FindFirstChildWhichIsA("TouchTransmitter") then withTI += 1 end
             if isLive(part) then alive += 1 end
+            if isDisabled(part) then off += 1 end
         end
         local tagged = 0
         pcall(function() tagged = #CS:GetTagged(CFG.ChestTag) end)
         beli()
-        return total, alive, withTI, tagged, (beliObj and beliObj:GetFullName() or nil)
+        return total, alive, withTI, tagged, (beliObj and beliObj:GetFullName() or nil), off
     end
 
     fullScan()
@@ -828,6 +959,24 @@ do
     local SPEEDS  = { "maxspeed", "empurrao" }
     Feat.boatMethods  = METHODS
     Feat.speedMethods = SPEEDS
+    Feat.leviDirs     = { "frente do barco", "longe das ilhas" }
+
+    -- o perigo do mar cresce com a DISTANCIA das ilhas (nao existe um lado
+    -- fixo): acha o centro das ilhas e aponta pro lado oposto.
+    local function awayFromIslands(pos)
+        local map = workspace:FindFirstChild("Map")
+        if not map then return nil end
+        local sum, n = Vector3.zero, 0
+        for _, isl in ipairs(map:GetChildren()) do
+            local ok, piv = pcall(function() return isl:GetPivot().Position end)
+            if ok and piv then sum += piv; n += 1 end
+        end
+        if n == 0 then return nil end
+        local c = sum / n
+        local d = Vector3.new(pos.X - c.X, 0, pos.Z - c.Z)
+        if d.Magnitude < 50 then return nil end
+        return d.Unit
+    end
 
     local boat, boatRoot
     local flyConn, bv
@@ -1072,12 +1221,21 @@ do
 
             if T.levi and active and not leviOn and boatRoot then
                 leviOn = true
-                local seat = Core.hum and Core.hum.SeatPart
-                local look = ((seat and seat.Parent) and seat or boatRoot).CFrame.LookVector
-                local d = Vector3.new(look.X, 0, look.Z)
-                d = (d.Magnitude > 0.1) and d.Unit or Vector3.new(0, 0, -1)
+                local d, how
+                if CFG.LeviDirMode == 2 then
+                    d = awayFromIslands(boatRoot.Position)
+                    how = "pra longe das ilhas"
+                end
+                if not d then
+                    local seat = Core.hum and Core.hum.SeatPart
+                    local look = ((seat and seat.Parent) and seat or boatRoot).CFrame.LookVector
+                    d = Vector3.new(look.X, 0, look.Z)
+                    d = (d.Magnitude > 0.1) and d.Unit or Vector3.new(0, 0, -1)
+                    how = "na direcao do barco"
+                end
                 levi = { state = "cruise", phase = "out", dir = d, legStart = boatRoot.Position }
-                Core.log("auto levi: cruzando na direcao do barco")
+                Core.log("auto levi: cruzando " .. how)
+                task.spawn(function() pcall(Feat.leviSpy) end)   -- so consulta, nao gasta nada
             elseif not T.levi and leviOn then
                 leviOn = false
                 levi = { state = "off" }
@@ -1101,11 +1259,24 @@ do
         speedPushOff()
     end)
 
-    -- remote REAL do espiao (verbo visto em scripts antigos, NAO confirmado
-    -- nessa versao): so consulta e mostra a resposta no Log.
+    -- remote REAL do espiao: "1" so CONSULTA (nao gasta fragmento). Respostas
+    -- relatadas por varias fontes da comunidade: 5 = o Leviathan ta la fora,
+    -- -1 = cooldown, outro numero = da pra subornar. O suborno ("2", 1500
+    -- fragmentos) fica de fora de proposito: o hub nao gasta teu recurso sozinho.
     function Feat.leviSpy()
         local ok, res = Net.commf("InfoLeviathan", "1")
-        Core.log("spy InfoLeviathan -> " .. tostring(ok) .. " / " .. tostring(res))
+        local meaning = "resposta desconhecida"
+        if not ok then
+            meaning = "remote falhou"
+        elseif res == 5 then
+            meaning = "o Leviathan TA LA FORA - vai pro mar 6"
+        elseif res == -1 then
+            meaning = "espiao em cooldown (nao sabe de nada ainda)"
+        elseif type(res) == "number" then
+            meaning = "ainda nao apareceu - suborna o espiao no Tiki Outpost (1500 fragmentos cada)"
+        end
+        Core.log("spy: " .. meaning .. " [" .. tostring(res) .. "]")
+        return res
     end
 end
 
@@ -1130,9 +1301,9 @@ function Feat.diagnose()
         .. " Hit:" .. yn(Net.R.Hit) .. " Browser:" .. yn(Net.R.Browser))
 
     if Feat.chestInfo then
-        local ok, total, alive, withTI, tagged, coin = pcall(Feat.chestInfo)
+        local ok, total, alive, withTI, tagged, coin, off = pcall(Feat.chestInfo)
         if ok then
-            L(("baus: %d achados, %d vivos, %d c/ touch, %d por tag"):format(total, alive, withTI, tagged))
+            L(("baus: %d achados, %d vivos, %d desativados, %d por tag"):format(total, alive, off or 0, tagged))
             L("moeda: " .. (coin or "NAO ACHADA"))
         else
             L("baus: erro -> " .. tostring(total))
@@ -1374,7 +1545,7 @@ local function buildGui()
         fill.BackgroundColor3 = COL.accent; Instance.new("UICorner", fill).CornerRadius = UDim.new(1,0)
         local function render()
             local v = CFG[cfgKey]
-            cap.Text = label..": "..tostring(v)
+            cap.Text = label..": "..((step < 1) and string.format("%.2f", v) or tostring(v))
             fill.Size = UDim2.fromScale(math.clamp((v-min)/(max-min),0,1), 1)
         end
         render()
@@ -1460,6 +1631,22 @@ local function buildGui()
     mkSlider(tune, "Chest Hold (delay)", "ChestHold", 0.05, 0.6, 0.01)
     mkSlider(tune, "Chest Stream Wait", "ChestStreamWait", 0.5, 4, 0.1)
     mkSlider(tune, "Chest Max Wait", "ChestMaxWait", 0.3, 2.0, 0.1)
+    do
+        local names = { "tp", "voo" }
+        local b = Instance.new("TextButton", tune)
+        b.Size = UDim2.fromOffset(210,30); b.BackgroundColor3 = COL.accent
+        b.TextColor3 = COL.txt; b.Font = Enum.Font.GothamMedium; b.TextSize = 13
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
+        local function paint() b.Text = "Bau longe: " .. (names[CFG.ChestFarMode] or "voo") end
+        paint()
+        b.MouseButton1Click:Connect(function()
+            CFG.ChestFarMode = (CFG.ChestFarMode % #names) + 1
+            paint(); Core.save()
+        end)
+    end
+    mkSlider(tune, "TP final (studs)", "ChestFarDist", 50, 1500, 50)
+    mkSlider(tune, "Voo do bau (vel.)", "ChestFlySpeed", 100, 350, 10)
+    mkSlider(tune, "Espera bau longe", "ChestFarWait", 1, 4, 0.1)
     mkSlider(tune, "Call Cooldown", "CallCooldown", 0.05, 0.5, 0.01)
 
     -- aba CUSTOM (verbos logados)
@@ -1511,6 +1698,13 @@ local function buildGui()
         actionBtn(methodName(), function(b)
             CFG.BoatMethod = (CFG.BoatMethod % #Feat.boatMethods) + 1
             b.Text = methodName(); Core.save()
+        end)
+        local function dirName()
+            return "Levi: " .. (Feat.leviDirs[CFG.LeviDirMode] or "longe das ilhas")
+        end
+        actionBtn(dirName(), function(b)
+            CFG.LeviDirMode = (CFG.LeviDirMode % #Feat.leviDirs) + 1
+            b.Text = dirName(); Core.save()
         end)
         actionBtn("Checar Spy (remote)", function() task.spawn(Feat.leviSpy) end)
 
@@ -1629,6 +1823,20 @@ Core.load()
 T.lift = false; T.levi = false; T.speed = false   -- barco so mexe quando VOCE ligar
 if type(CFG.BoatMethod) ~= "number" or CFG.BoatMethod < 1 or CFG.BoatMethod > 3 then CFG.BoatMethod = 1 end
 if type(CFG.SpeedMethod) ~= "number" or CFG.SpeedMethod < 1 or CFG.SpeedMethod > 2 then CFG.SpeedMethod = 1 end
+if CFG.ChestFarMode ~= 1 and CFG.ChestFarMode ~= 2 then CFG.ChestFarMode = 2 end
+if CFG.LeviDirMode ~= 1 and CFG.LeviDirMode ~= 2 then CFG.LeviDirMode = 2 end
+do  -- config salva antiga ganha os nomes novos (LeviathanGate fica em workspace.Map)
+    local function ensure(list, value)
+        if type(list) ~= "table" then return end
+        for _, v in ipairs(list) do
+            if v == value then return end
+        end
+        table.insert(list, 1, value)
+    end
+    ensure(CFG.LeviSigns, "LeviathanGate")
+    ensure(CFG.LeviContainers, "SeaBeasts")
+    ensure(CFG.LeviContainers, "Map")
+end
 versionGuard()
 buildGui()
 Core.log("hub PRO carregado")
