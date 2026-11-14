@@ -1,33 +1,31 @@
 --[[
 ================================================================
   BF AFK HUB  ::  PRO
-  auto-farm / anti-idle  ::  Luau  ::  Delta (mobile)
-  Do zero. Sem loadstring, sem codigo de terceiros, sem rede.
+  Blox Fruits  ::  Luau  ::  Delta (mobile)
+  Feito do zero. Sem loadstring, sem codigo de terceiros, sem rede.
 ================================================================
 
-NOVO NESSA VERSAO
-  - Arquitetura modular (Core / Remotes / Features / UI)
-  - Resolver de remotes com WATCHDOG: se os remotes somem apos
-    update, ele re-resolve sozinho e so desliga a feature se
-    realmente nao achar (em vez de disparar verbo errado)
-  - GUI com ABAS, sliders, status ao vivo e CONSOLE embutido
-    (pra voce ver o que ta rolando sem o dev console do Delta)
-  - Persistencia: salva seus toggles/sliders em arquivo e
-    recarrega no proximo boot (se o Delta tiver writefile)
-  - Coletor de bau com RETRY MEDIDO: confirma se o bau sumiu,
-    e so entao vai pro proximo. O mais rapido sem perder bau.
-  - Auto-farm com PRIORIDADE DE QUEST: le o mob da quest no
-    tracker e foca nele; senao, o mais perto
-  - Auto-stat (AddPoint) com distribuicao configuravel
-  - VERBOS CUSTOMIZADOS salvos: depois de logar CDK / Soul /
-    Halloween, salva como botao nomeado e reusa
+ABAS (a barra de abas rola pro lado)
+  Main   - Auto Farm, Auto Quest, Auto Chest, Auto Stat, Auto Buso,
+           Anti-Idle, Hop Server manual, PARAR TUDO
+  Farm   - mob (vazio = quest do teu level), metodo de ataque, arma,
+           altura, velocidade
+  Boat   - Boat Speed, Levantar Barco, Auto Leviathan
+  Extra  - avisar/pegar/guardar fruta, avisos de evento e lua cheia,
+           tela branca, FPS boost, elite, gacha
+  Tune   - ajustes finos do bau
+  Custom - rodar/salvar verbos do CommF_
+  Log    - console, Diagnostico e Copiar Log
 
-O QUE CONTINUA SENDO SEU (muda por update, logger resolve):
-  - nome da pasta de mobs           -> CONFIG.EnemyFolders
-  - QuestGiverId / QuestIndex        -> do logger (CommF_ StartQuest)
-  - CDK / Soul / Halloween           -> aba "Custom", botao Run+Save
+ANTI-PUXAO
+  O puxao e o server corrigindo tua posicao; nao da pra desligar.
+  O hub voa com teto de velocidade, usa pulo instantaneo so em
+  distancia curta e, quando percebe um puxao, pausa e recua
+  (mais devagar, pulo menor) em vez de brigar.
 
-Roda o logger (bf_remotes_e_baus.txt) pra achar os verbos reais.
+AVISO
+  Automatizar o jogo quebra as regras do Roblox / Blox Fruits e pode
+  dar kick ou ban. Usa conta alt.
 ================================================================
 ]]
 
@@ -69,6 +67,19 @@ local DEFAULTS = {
     ChestPreTouch    = 0.25,    -- bau longe: fica parado isso ANTES do 1o toque
     ChestRetouch     = 0.35,    -- re-toca nesse intervalo enquanto espera pagar
     ChestFailPause   = 6,       -- tantos baus seguidos sem pagar = pausa de 30s
+
+    -- auto farm
+    FarmMob         = "",        -- nome do mob (vazio = decide pela quest do teu level)
+    FarmHover       = 8,         -- altura em cima do mob
+    FarmHop         = 150,       -- ate essa distancia vai de pulo instantaneo; mais longe, voa
+    FarmFlySpeed    = 280,       -- studs/s do voo ate o mob / NPC
+    FarmAttack      = 0,         -- 0 = auto (testa e escolhe) | 1 remote | 2 tecla | 3 clique | 4 tool | 5 tecla+clique
+    FarmKeys        = "ZXC",     -- teclas de skill do metodo "tecla"
+    FarmWeapon      = 1,         -- 1 qualquer | 2 Melee | 3 Sword | 4 Blox Fruit | 5 Gun
+    FarmSetSpawn    = true,      -- salva o spawn perto do NPC da quest (morreu, volta ali)
+
+    -- avisos (filhos de workspace.Map que valem um aviso quando aparecem)
+    WatchNames      = { "MysticIsland", "LeviathanGate", "KitsuneIsland", "PrehistoricIsland" },
 
     -- barco (levantar / velocidade / auto leviathan)
     BoatFolder      = "Boats",   -- pasta dos barcos no workspace (fallback: o modelo do assento)
@@ -129,8 +140,10 @@ end
 getgenv().BFHUB = {}
 local HUB = getgenv().BFHUB
 HUB.alive = true
-HUB.toggles = { farm = false, quest = false, chest = false, stat = false, idle = true,
-                lift = false, levi = false, speed = false }
+HUB.toggles = { farm = false, quest = true, chest = false, stat = false, idle = true,
+                lift = false, levi = false, speed = false,
+                buso = false, fruit = false, fruitGrab = false, fruitStore = false,
+                watch = false, white = false }
 HUB.config  = table.clone(DEFAULTS)
 HUB.custom  = {}   -- { {name=, verb=, args={}} }
 
@@ -139,7 +152,7 @@ local T   = HUB.toggles
 for k, v in pairs(DEFAULTS) do
     if CFG[k] == nil then CFG[k] = v end
 end
-HUB.stats = HUB.stats or { chests = 0, beli = 0, fails = 0, snaps = 0 }
+HUB.stats = HUB.stats or { chests = 0, beli = 0, fails = 0, snaps = 0, kills = 0 }
 
 -- ============================================================
 -- 2. CORE: log, persistencia, utils, character refresh
@@ -156,6 +169,16 @@ do
         if #Core.logLines > 150 then table.remove(Core.logLines, 1) end
         print("[BFHUB] " .. msg)
         if Core.logHook then pcall(Core.logHook) end
+    end
+
+    -- resposta de remote em texto curto (tabela vira JSON)
+    function Core.fmt(v)
+        if type(v) == "table" then
+            local ok, js = pcall(function() return HttpSvc:JSONEncode(v) end)
+            if ok and type(js) == "string" then return string.sub(js, 1, 140) end
+            return "tabela"
+        end
+        return tostring(v)
     end
 
     -- persistencia (guardada; Delta as vezes nao expoe writefile)
@@ -240,6 +263,157 @@ do
 end
 
 -- ============================================================
+-- 2.5 MOVE: viagem com velocidade limitada + ANTI-PUXAO
+-- ============================================================
+-- O "puxao" (rubberband) e o SERVER corrigindo tua posicao. Nao tem como
+-- desligar isso pelo cliente (quem promete "bypass" entrega placebo).
+-- O que funciona de verdade, e o que esse modulo faz:
+--   1) voar com teto de velocidade em vez de pular longe
+--   2) pulo instantaneo so em distancia curta
+--   3) PERCEBER quando o server puxa e recuar (pausa + mais devagar + pulo
+--      menor) em vez de brigar - brigar e o que acumula pro Security Kick
+local Move = {}
+do
+    local RunSvc = game:GetService("RunService")
+    Move.scale    = 1            -- multiplicador da velocidade (cai a cada puxao)
+    Move.hopScale = 1            -- multiplicador do pulo instantaneo
+    Move.pulls    = 0
+    Move.lastPull = -math.huge
+
+    function Move.speed(base)
+        return math.max(60, (tonumber(base) or 250) * Move.scale)
+    end
+
+    function Move.hop(base)
+        return math.max(40, (tonumber(base) or 150) * Move.hopScale)
+    end
+
+    -- registra um puxao e recua
+    function Move.pulled(what, dist)
+        Move.pulls += 1
+        Move.lastPull = os.clock()
+        HUB.stats.snaps = (HUB.stats.snaps or 0) + 1
+        Move.scale = math.max(0.4, Move.scale * 0.85)
+        Move.hopScale = math.max(0.25, Move.hopScale * 0.75)
+        Core.log(("puxao #%d (%s, %d studs) - recuando: velocidade %d%%, pulo %d%%"):format(
+            Move.pulls, tostring(what), math.floor(dist or 0),
+            math.floor(Move.scale * 100), math.floor(Move.hopScale * 100)))
+    end
+
+    -- um minuto sem puxao: devolve a velocidade aos poucos
+    task.spawn(function()
+        while HUB.alive do
+            task.wait(20)
+            if os.clock() - Move.lastPull > 60 then
+                Move.scale = math.min(1, Move.scale + 0.05)
+                Move.hopScale = math.min(1, Move.hopScale + 0.05)
+            end
+        end
+    end)
+
+    -- fica parado no ar (sem escrever posicao) deixando o server "assentar"
+    function Move.settle(sec)
+        local t0 = os.clock()
+        while os.clock() - t0 < sec and HUB.alive do
+            local r = Core.root
+            if r then r.AssemblyLinearVelocity = Vector3.zero end
+            RunSvc.Heartbeat:Wait()
+        end
+    end
+
+    -- noclip compartilhado (cada modulo pede com o proprio nome)
+    local ncOwners, ncConn = {}, nil
+    function Move.noclip(owner, on)
+        ncOwners[owner] = on and true or nil
+        local any = next(ncOwners) ~= nil
+        if any and not ncConn then
+            ncConn = RunSvc.Stepped:Connect(function()
+                if not HUB.alive then
+                    if ncConn then ncConn:Disconnect(); ncConn = nil end
+                    return
+                end
+                local c = Core.char
+                if not c then return end
+                for _, v in ipairs(c:GetDescendants()) do
+                    if v:IsA("BasePart") and v.CanCollide then v.CanCollide = false end
+                end
+            end)
+        elseif not any and ncConn then
+            ncConn:Disconnect()
+            ncConn = nil
+        end
+    end
+
+    -- Voa ate goalFn() (Vector3) e devolve true quando faltar stopDist.
+    -- goalFn devolvendo nil ou keepFn() == false aborta (devolve false).
+    function Move.fly(goalFn, stopDist, baseSpeed, keepFn, flyUp)
+        local r = Core.root
+        local goal = goalFn()
+        if not r or not goal then return false end
+        stopDist = math.max(stopDist or 3, 3)
+        local cruiseY = math.max(r.Position.Y, goal.Y) + (flyUp or 40)
+        local deadline = os.clock() + 180
+        local lastSet = nil
+        while HUB.alive and Core.alive() and (keepFn == nil or keepFn()) do
+            local dt = RunSvc.Heartbeat:Wait()
+            r = Core.root
+            if not r then return false end
+            goal = goalFn()
+            if not goal then return false end
+            if os.clock() > deadline then
+                Core.log("voo estourou o tempo (3 min) - desistindo desse destino")
+                return false
+            end
+            local pos = r.Position
+            -- ANTI-PUXAO: eu deixei o personagem em lastSet. Se ele apareceu
+            -- longe dali, foi o server que corrigiu: para, espera e recua.
+            if lastSet then
+                local drift = (pos - lastSet).Magnitude
+                if drift > math.max(18, Move.speed(baseSpeed) * dt * 3) then
+                    Move.pulled("voo", drift)
+                    lastSet = nil
+                    Move.settle(1.2)
+                    continue
+                end
+            end
+            if (goal - pos).Magnitude <= stopDist then return true end
+            local flat = Vector3.new(goal.X - pos.X, 0, goal.Z - pos.Z).Magnitude
+            -- longe: voa na altura de cruzeiro; chegando: desce no destino
+            local aim = goal
+            if flat > math.max(stopDist, 25) then
+                aim = Vector3.new(goal.X, cruiseY, goal.Z)
+            end
+            local delta = aim - pos
+            local dist = delta.Magnitude
+            if dist > 0.01 then
+                local stepLen = math.min(dist, Move.speed(baseSpeed) * dt)
+                lastSet = pos + delta.Unit * stepLen
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = CFrame.new(lastSet)
+            end
+        end
+        return false
+    end
+
+    -- Vai ate um ponto: perto = pulo instantaneo; longe = voo + pulo final curto.
+    function Move.goTo(goalFn, hopBase, baseSpeed, keepFn)
+        local r = Core.root
+        local goal = goalFn()
+        if not r or not goal then return false end
+        local hop = Move.hop(hopBase)
+        if (goal - r.Position).Magnitude > hop then
+            if not Move.fly(goalFn, hop, baseSpeed, keepFn) then return false end
+        end
+        r = Core.root
+        goal = goalFn()
+        if not r or not goal then return false end
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.CFrame = CFrame.new(goal)
+        return true
+    end
+end
+
+-- ============================================================
 -- 3. REMOTES: resolucao dinamica + watchdog
 -- ============================================================
 local Net = {}
@@ -313,8 +487,7 @@ local function versionGuard()
     Core.log("PlaceVersion = " .. tostring(game.PlaceVersion))
     if #miss > 0 then
         Core.log("!! remotes faltando: " .. table.concat(miss, ", "))
-        Core.log("!! o jogo deve ter atualizado - roda o logger e ajusta antes do farm")
-        T.farm = false; T.quest = false
+        Core.log("!! o jogo deve ter atualizado - o que depender deles pode nao funcionar")
         return false
     end
     Core.log("remotes ok")
@@ -325,6 +498,13 @@ end
 -- 5. FEATURES
 -- ============================================================
 local Feat = {}
+
+function Feat.notify(title, text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification",
+            { Title = title, Text = text, Duration = 8 })
+    end)
+end
 
 -- ---- 5.1 anti-idle ----
 do
@@ -369,88 +549,776 @@ do
     end
 end
 
--- ---- 5.3 auto-farm de combate ----
+-- ---- 5.3 auto-farm v2 (quest + mob + ataque) ----
+-- Montado em cima do que a pesquisa achou nos scripts publicos (as ideias,
+-- em palavras - nenhum codigo copiado):
+--   - level em Data.Level; a quest certa sai dos modulos do proprio jogo
+--     (Quests / GuideModule) e, se eles mudaram, de uma tabela reserva
+--   - StartQuest direto pelo CommF_ (sem andar ate o NPC nem clicar)
+--   - mob vivo em workspace.Enemies; sem mob vivo, espera no ponto de spawn
+--   - fica parado EM CIMA do mob: velocidade zerada, noclip, nunca ancorado
+--   - ataque: o update 30 quebrou o "fast attack" antigo, entao o hub TESTA
+--     cada metodo no mob (tecla de skill / clique / tool / remote) e fica com
+--     o que tirar vida de verdade
 do
-    -- le o nome do mob da quest no tracker da UI
-    local function questMobName()
-        local gui = lp:FindFirstChild("PlayerGui")
-        local q = gui and gui:FindFirstChild("Main") and gui.Main:FindFirstChild("Quest")
-        if not q or not q.Visible then return nil end
-        for _, t in ipairs(q:GetDescendants()) do
-            if t:IsA("TextLabel") and t.Text:match("%a") and not t.Text:match("Quest") then
-                return t.Text:gsub("%s*%[.-%]", ""):gsub("%d+/%d+", ""):match("^%s*(.-)%s*$")
-            end
+    local RunSvc = game:GetService("RunService")
+    local VIM, VU
+    pcall(function() VIM = game:GetService("VirtualInputManager") end)
+    pcall(function() VU = game:GetService("VirtualUser") end)
+
+    local ATTACKS = { "remote", "tecla", "clique", "tool", "tecla+clique" }
+    local WEAPONS = { "qualquer", "Melee", "Sword", "Blox Fruit", "Gun" }
+    Feat.farmAttacks = ATTACKS
+    Feat.farmWeapons = WEAPONS
+
+    local SEA1, SEA2, SEA3 = 2753915549, 4442272183, 7449423635
+    -- tabela reserva (ids antigos do Sea 1; o update 30 refez as ilhas, entao
+    -- so e usada se o modulo Quests do jogo nao abrir)
+    local SEA1_QUESTS = {
+        { 1,   "BanditQuest1",   1, "Bandit" },
+        { 10,  "JungleQuest",    1, "Monkey" },
+        { 15,  "JungleQuest",    2, "Gorilla" },
+        { 30,  "BuggyQuest1",    1, "Pirate" },
+        { 40,  "BuggyQuest1",    2, "Brute" },
+        { 60,  "DesertQuest",    1, "Desert Bandit" },
+        { 75,  "DesertQuest",    2, "Desert Officer" },
+        { 90,  "SnowQuest",      1, "Snow Bandit" },
+        { 100, "SnowQuest",      2, "Snowman" },
+        { 120, "MarineQuest2",   1, "Chief Petty Officer" },
+        { 150, "SkyQuest",       1, "Sky Bandit" },
+        { 175, "SkyQuest",       2, "Dark Master" },
+        { 190, "PrisonerQuest",  1, "Prisoner" },
+        { 210, "PrisonerQuest",  2, "Dangerous Prisoner" },
+        { 250, "ColosseumQuest", 1, "Toga Warrior" },
+        { 275, "ColosseumQuest", 2, "Gladiator" },
+        { 300, "MagmaQuest",     1, "Military Soldier" },
+        { 325, "MagmaQuest",     2, "Military Spy" },
+        { 375, "FishmanQuest",   1, "Fishman Warrior" },
+        { 400, "FishmanQuest",   2, "Fishman Commando" },
+        { 450, "SkyExp1Quest",   1, "God's Guard" },
+        { 475, "SkyExp1Quest",   2, "Shanda" },
+        { 525, "SkyExp2Quest",   1, "Royal Squad" },
+        { 550, "SkyExp2Quest",   2, "Royal Soldier" },
+        { 625, "FountainQuest",  1, "Galley Pirate" },
+        { 650, "FountainQuest",  2, "Galley Captain" },
+    }
+
+    local st = {
+        db = nil, dbSrc = "ainda nao carregada", npcs = nil,
+        quest = nil, questLevel = -1, questAt = 0,
+        lastStart = 0, lastAbandon = -math.huge, titleBad = false,
+        npcTried = {}, spawnSet = {},
+        best = nil, reprobeAt = 0,
+        lastWarn = {}, skip = {},
+        status = "parado",
+    }
+
+    local function warnOnce(key, sec, msg)
+        local now = os.clock()
+        if now - (st.lastWarn[key] or -math.huge) >= sec then
+            st.lastWarn[key] = now
+            Core.log(msg)
         end
     end
 
-    local function enemies()
-        local out, r = {}, Core.root
-        if not r then return out end
-        local want = CFG.QuestPriority and questMobName() or nil
-        for _, fname in ipairs(CFG.EnemyFolders) do
-            local folder = workspace:FindFirstChild(fname)
-            if folder then
-                for _, e in ipairs(folder:GetChildren()) do
-                    local h  = e:FindFirstChildWhichIsA("Humanoid")
-                    local hr = e:FindFirstChild("HumanoidRootPart")
-                    if h and hr and h.Health > 0 then
-                        local priority = (want and e.Name:find(want, 1, true)) and 0 or 1
-                        table.insert(out, { model = e, hrp = hr, prio = priority,
-                                            dist = (hr.Position - r.Position).Magnitude })
+    -- "Bandit [Lv. 5]" -> "Bandit"
+    local function baseName(name)
+        return (string.gsub(name, "%s*%[.-%]%s*$", ""))
+    end
+
+    local function isMob(name, mob)
+        return name == mob or baseName(name) == mob
+    end
+
+    local function playerLevel()
+        local lvl
+        pcall(function() lvl = lp.Data.Level.Value end)
+        if type(lvl) == "number" then return lvl end
+        return nil
+    end
+
+    -- ---------- dados de quest ----------
+    local function loadDB()
+        local list = {}
+        -- modulos do proprio jogo. o formato pode ter mudado no update 30,
+        -- entao tudo aqui e pcall + conferencia de tipo
+        local okQ, quests = pcall(function()
+            local m = RS:FindFirstChild("Quests")
+            if m and m:IsA("ModuleScript") then return require(m) end
+            return nil
+        end)
+        if okQ and type(quests) == "table" then
+            for id, tiers in pairs(quests) do
+                if type(id) == "string" and type(tiers) == "table" then
+                    for tier, info in pairs(tiers) do
+                        if type(tier) == "number" and type(info) == "table"
+                            and type(info.LevelReq) == "number" and type(info.Task) == "table" then
+                            local mob, count = next(info.Task)
+                            -- count 1 = quest de chefe; fica de fora do farm de level
+                            if type(mob) == "string" and type(count) == "number" and count > 1 then
+                                table.insert(list, { level = info.LevelReq, id = id, tier = tier, mob = mob })
+                            end
+                        end
                     end
                 end
             end
         end
-        table.sort(out, function(a, b)
-            if a.prio ~= b.prio then return a.prio < b.prio end
-            return a.dist < b.dist
+        if #list > 0 then
+            st.dbSrc = "modulo do jogo (" .. #list .. " quests)"
+        elseif game.PlaceId == SEA1 then
+            for _, q in ipairs(SEA1_QUESTS) do
+                table.insert(list, { level = q[1], id = q[2], tier = q[3], mob = q[4] })
+            end
+            st.dbSrc = "tabela reserva do Sea 1 (" .. #list .. " quests, ids antigos)"
+        else
+            st.dbSrc = "nenhuma (modulo Quests nao abriu e nao tenho tabela desse mar)"
+        end
+        table.sort(list, function(a, b) return a.level < b.level end)
+        st.db = list
+
+        local okG, guide = pcall(function()
+            local m = RS:FindFirstChild("GuideModule")
+            if m and m:IsA("ModuleScript") then return require(m) end
+            return nil
         end)
-        return out
+        if okG and type(guide) == "table" and type(guide.Data) == "table"
+            and type(guide.Data.NPCList) == "table" then
+            st.npcs = guide.Data.NPCList
+        end
+        Core.log("farm: quests = " .. st.dbSrc .. (st.npcs and " + posicao dos NPCs" or ""))
+    end
+
+    -- nomes de mob que existem NESSE mar (vivos, pontos de spawn, estacionados)
+    local function namesHere()
+        local set = {}
+        local function add(container)
+            if not container then return end
+            for _, c in ipairs(container:GetChildren()) do
+                set[baseName(c.Name)] = true
+            end
+        end
+        for _, fname in ipairs(CFG.EnemyFolders) do
+            add(workspace:FindFirstChild(fname))
+        end
+        local wo = workspace:FindFirstChild("_WorldOrigin")
+        add(wo and wo:FindFirstChild("EnemySpawns"))
+        for _, c in ipairs(RS:GetChildren()) do
+            if c:IsA("Model") then set[baseName(c.Name)] = true end
+        end
+        return set
+    end
+
+    local function chooseQuest()
+        if type(CFG.QuestGiverId) == "string" and CFG.QuestGiverId ~= "" then
+            -- quest escolhida na mao (config): usa ela e pronto
+            local manualMob = nil
+            if type(CFG.FarmMob) == "string" and CFG.FarmMob ~= "" then manualMob = CFG.FarmMob end
+            return { id = CFG.QuestGiverId, tier = CFG.QuestIndex, level = 0, mob = manualMob, manual = true }
+        end
+        if not st.db then loadDB() end
+        if #st.db == 0 then
+            warnOnce("nodb", 120, "farm: sem tabela de quests desse mar - bato no mob mais perto (ou escreve o nome do mob na aba Farm)")
+            return nil
+        end
+        local lvl = playerLevel()
+        if not lvl then
+            warnOnce("lvl", 30, "farm: nao consegui ler teu level (Data.Level)")
+            return nil
+        end
+        if st.quest and st.questLevel == lvl and os.clock() - st.questAt < 30 then
+            return st.quest
+        end
+        local here = namesHere()
+        local pick, first = nil, nil
+        for i = #st.db, 1, -1 do
+            local q = st.db[i]
+            if q.level <= lvl then
+                first = first or q
+                if here[q.mob] then
+                    pick = q
+                    break
+                end
+            end
+        end
+        pick = pick or first
+        if pick and (not st.quest or st.quest.id ~= pick.id or st.quest.tier ~= pick.tier) then
+            Core.log(("farm: level %d -> quest %s %s (%s)"):format(
+                math.floor(lvl), tostring(pick.id), tostring(pick.tier), tostring(pick.mob)))
+        end
+        st.quest, st.questLevel, st.questAt = pick, lvl, os.clock()
+        return pick
+    end
+
+    -- painel da quest: devolve visivel (true/false, ou nil se nao achei o
+    -- painel) e o texto do titulo
+    local function questState()
+        local pg = lp:FindFirstChild("PlayerGui")
+        local main = pg and pg:FindFirstChild("Main")
+        local q = main and main:FindFirstChild("Quest")
+        if not q then return nil, "" end
+        local vis = false
+        pcall(function() vis = q.Visible and true or false end)
+        local title = ""
+        pcall(function() title = q.Container.QuestTitle.Title.Text end)
+        if title == "" and vis then
+            local bits = {}
+            for _, d in ipairs(q:GetDescendants()) do
+                if d:IsA("TextLabel") and #d.Text > 3 and #bits < 6 then
+                    table.insert(bits, d.Text)
+                end
+            end
+            title = table.concat(bits, " ")
+        end
+        return vis, title
+    end
+
+    local function npcPosFor(q)
+        if not st.npcs or not q.level then return nil end
+        for key, e in pairs(st.npcs) do
+            if type(e) == "table" and type(e.Levels) == "table" then
+                for _, lv in pairs(e.Levels) do
+                    if lv == q.level then
+                        local p = e.Position or e.CFrame
+                        if typeof(p) == "CFrame" then p = p.Position end
+                        if typeof(p) ~= "Vector3" and typeof(key) == "Instance" then
+                            local ok, piv = pcall(function() return key:GetPivot().Position end)
+                            if ok then p = piv end
+                        end
+                        if typeof(p) == "Vector3" then return p end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function startQuest(q)
+        st.lastStart = os.clock()
+        local _, res = Net.commf("StartQuest", q.id, q.tier)
+        task.wait(0.7)
+        local vis, title = questState()
+        if vis then
+            Core.log(("farm: quest pega - %s %s"):format(tostring(q.id), tostring(q.tier)))
+            -- se o titulo nao cita o mob nem depois de EU pegar a quest, o
+            -- titulo nao serve pra conferir: nunca mais abandono por causa dele
+            if q.mob and title ~= "" and not string.find(title, q.mob, 1, true) then
+                st.titleBad = true
+            end
+            return true
+        end
+        if vis == false then
+            warnOnce("startfail", 30, ("farm: StartQuest %s %s nao pegou daqui (resposta: %s)"):format(
+                tostring(q.id), tostring(q.tier), Core.fmt(res)))
+        end
+        return false
+    end
+
+    -- ---------- segurar o personagem em cima do mob ----------
+    local hold = { pos = nil, look = nil, lastSet = nil, pause = 0, replan = false }
+    local holdConn = nil
+
+    local function holdOn()
+        if holdConn then return end
+        holdConn = RunSvc.Heartbeat:Connect(function()
+            if not HUB.alive then
+                if holdConn then holdConn:Disconnect(); holdConn = nil end
+                return
+            end
+            local r = Core.root
+            if not r or not hold.pos then return end
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+            if os.clock() < hold.pause then return end
+            -- ANTI-PUXAO: se o server me tirou de onde eu me deixei, nao brigo:
+            -- solto a posicao e o farm replaneja a partir de onde ele me pos
+            if hold.lastSet then
+                local drift = (r.Position - hold.lastSet).Magnitude
+                if drift > 25 then
+                    Move.pulled("farm", drift)
+                    hold.pos, hold.look, hold.lastSet = nil, nil, nil
+                    hold.pause = os.clock() + 1.2
+                    hold.replan = true
+                    return
+                end
+            end
+            if hold.look and (hold.look - hold.pos).Magnitude > 0.5 then
+                r.CFrame = CFrame.lookAt(hold.pos, hold.look)
+            else
+                r.CFrame = CFrame.new(hold.pos)
+            end
+            hold.lastSet = hold.pos
+        end)
+    end
+
+    local function holdClear()
+        hold.pos, hold.look, hold.lastSet = nil, nil, nil
+    end
+
+    local function aimAt(t)
+        local p = t.hrp.Position
+        -- um pouco pra tras pra nunca olhar reto pra baixo (CFrame.lookAt degenera)
+        hold.pos = p + Vector3.new(0, CFG.FarmHover, 3)
+        hold.look = p
+    end
+
+    local function keep()
+        return T.farm and not T.chest and not Feat.boatBusy and not Feat.fruitBusy
+    end
+
+    function Feat.farmStop()
+        st.status = "parado"
+        holdClear()
+        hold.replan = false
+        if holdConn then holdConn:Disconnect(); holdConn = nil end
+        Move.noclip("farm", false)
+        Feat.farmBusy = false
+    end
+
+    -- ---------- quest ----------
+    local function manageQuest(q)
+        local vis, title = questState()
+        local now = os.clock()
+        if vis == nil then
+            -- o HUD mudou e nao acho o painel: sem como saber se tem quest ativa
+            warnOnce("notrack", 60, "farm: nao achei o painel da quest (Main.Quest) - pegando quest as cegas a cada 45s")
+            if now - st.lastStart > 45 then startQuest(q) end
+            return
+        end
+        if vis then
+            if q.mob and not q.manual and not st.titleBad and title ~= ""
+                and not string.find(title, q.mob, 1, true)
+                and now - st.lastAbandon > 60 then
+                st.lastAbandon = now
+                st.lastStart = 0
+                Core.log("farm: a quest ativa e de outro mob - abandonando pra pegar a certa")
+                Net.commf("AbandonQuest")
+            end
+            return
+        end
+        if now - st.lastStart < 4 then return end
+        if startQuest(q) then return end
+
+        -- o server nao aceitou daqui: chega perto do NPC (se eu souber onde
+        -- ele fica) e tenta de novo. so tenta isso 1x a cada 2 min por quest.
+        local key = tostring(q.id) .. ":" .. tostring(q.tier)
+        if (st.npcTried[key] or 0) > now then return end
+        st.npcTried[key] = now + 120
+        local pos = npcPosFor(q)
+        if not pos then
+            Core.log("farm: nao sei onde fica o NPC dessa quest - sigo farmando sem quest e tento de novo em 2 min")
+            return
+        end
+        st.status = "indo ate o NPC da quest"
+        holdOn()
+        Move.noclip("farm", true)
+        holdClear()
+        local spot = pos + Vector3.new(0, 4, 4)
+        if Move.goTo(function() return spot end, CFG.FarmHop, CFG.FarmFlySpeed, keep) then
+            hold.pos, hold.look = spot, pos
+            task.wait(1.1)
+            if startQuest(q) and CFG.FarmSetSpawn and not st.spawnSet[q.id] then
+                st.spawnSet[q.id] = true
+                Net.commf("SetSpawnPoint")
+            end
+        end
+    end
+
+    -- ---------- alvo ----------
+    local function pickTarget(mob)
+        local r = Core.root
+        if not r then return nil end
+        local now, best = os.clock(), nil
+        for _, fname in ipairs(CFG.EnemyFolders) do
+            local f = workspace:FindFirstChild(fname)
+            if f then
+                for _, e in ipairs(f:GetChildren()) do
+                    if (mob == nil or isMob(e.Name, mob)) and (st.skip[e] or 0) < now then
+                        local h = e:FindFirstChildWhichIsA("Humanoid")
+                        local hr = e:FindFirstChild("HumanoidRootPart")
+                        if h and hr and h.Health > 0 then
+                            local d = (hr.Position - r.Position).Magnitude
+                            -- sem mob definido: so pega o que ta perto (nao sai cacando chefe)
+                            if (mob ~= nil or d <= CFG.AttackRange) and (best == nil or d < best.dist) then
+                                best = { model = e, hum = h, hrp = hr, dist = d }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    -- onde esse mob nasce (pra esperar no lugar certo quando nao tem nenhum vivo)
+    local function areaOf(mob)
+        local r = Core.root
+        local wo = workspace:FindFirstChild("_WorldOrigin")
+        local sp = wo and wo:FindFirstChild("EnemySpawns")
+        local best, bestD = nil, math.huge
+        if sp and r then
+            for _, s in ipairs(sp:GetChildren()) do
+                if isMob(s.Name, mob) then
+                    local ok, pos = pcall(function()
+                        if s:IsA("BasePart") then return s.Position end
+                        return s:GetPivot().Position
+                    end)
+                    if ok and typeof(pos) == "Vector3" then
+                        local d = (pos - r.Position).Magnitude
+                        if d < bestD then best, bestD = pos, d end
+                    end
+                end
+            end
+        end
+        if best then return best end
+        -- inimigo "estacionado" no ReplicatedStorage guarda a posicao de onde nasce
+        for _, e in ipairs(RS:GetChildren()) do
+            if e:IsA("Model") and isMob(e.Name, mob) then
+                local ok, pos = pcall(function() return e:GetPivot().Position end)
+                if ok and typeof(pos) == "Vector3" and pos.Magnitude > 1 then return pos end
+            end
+        end
+        return nil
+    end
+
+    -- ---------- arma ----------
+    local function usable(tool)
+        if not tool:IsA("Tool") then return false end
+        if tool:FindFirstChild("EatRemote") then return false end   -- fruta de comer: clicar COME ela
+        if string.find(string.lower(tool.Name), "fishing", 1, true) then return false end
+        return true
     end
 
     local function equip()
-        local char, bp = Core.char, lp:FindFirstChild("Backpack")
-        if not char or not bp then return end
-        if char:FindFirstChildWhichIsA("Tool") then return end
-        local tool = bp:FindFirstChildWhichIsA("Tool")
-        if tool and Core.hum then Core.hum:EquipTool(tool) end
+        local char, hum = Core.char, Core.hum
+        if not char or not hum then return nil end
+        local want = nil
+        if type(CFG.FarmWeapon) == "number" and CFG.FarmWeapon > 1 then want = WEAPONS[CFG.FarmWeapon] end
+        local function fits(tool)
+            return usable(tool) and (want == nil or tool.ToolTip == want)
+        end
+        local held = char:FindFirstChildWhichIsA("Tool")
+        if held and fits(held) then return held end
+        local bp = lp:FindFirstChild("Backpack")
+        local pick = nil
+        if bp then
+            for _, tool in ipairs(bp:GetChildren()) do
+                if fits(tool) then
+                    pick = tool
+                    break
+                end
+            end
+            if not pick and want then
+                warnOnce("weapon", 60, "farm: nao achei arma do tipo " .. tostring(want) .. " - usando a primeira que servir")
+                for _, tool in ipairs(bp:GetChildren()) do
+                    if usable(tool) then
+                        pick = tool
+                        break
+                    end
+                end
+            end
+        end
+        if pick then
+            pcall(function() hum:EquipTool(pick) end)
+            return pick
+        end
+        if held and usable(held) then return held end
+        warnOnce("notool", 30, "farm: nenhuma arma no inventario pra equipar")
+        return nil
     end
 
+    -- ---------- metodos de ataque ----------
+    local keyIdx = 0
+    local function pressKey()
+        if not VIM then return end
+        local keys = CFG.FarmKeys
+        if type(keys) ~= "string" or #keys == 0 then keys = "ZXC" end
+        keyIdx = keyIdx % #keys + 1
+        local letter = string.upper(string.sub(keys, keyIdx, keyIdx))
+        pcall(function()
+            local kc = Enum.KeyCode[letter]
+            VIM:SendKeyEvent(true, kc, false, game)
+            task.wait(0.06)
+            VIM:SendKeyEvent(false, kc, false, game)
+        end)
+    end
+
+    -- ponto da tela pra "clicar" que nao cai em cima da janela do hub
+    local function clickPoint()
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        local cands = {
+            Vector2.new(vp.X * 0.50, vp.Y * 0.45),
+            Vector2.new(vp.X * 0.68, vp.Y * 0.40),
+            Vector2.new(vp.X * 0.50, vp.Y * 0.22),
+            Vector2.new(vp.X * 0.32, vp.Y * 0.40),
+        }
+        local win = HUB._win
+        for _, c in ipairs(cands) do
+            local inside = false
+            if win and win.Parent then
+                local a, s = win.AbsolutePosition, win.AbsoluteSize
+                inside = c.X >= a.X - 45 and c.X <= a.X + s.X + 45
+                    and c.Y >= a.Y - 45 and c.Y <= a.Y + s.Y + 45
+            end
+            if not inside then return c end
+        end
+        return cands[1]
+    end
+
+    local function click()
+        local c = clickPoint()
+        if VIM then
+            if UIS.TouchEnabled then
+                pcall(function()
+                    VIM:SendTouchEvent(7, 0, c.X, c.Y)
+                    task.wait(0.03)
+                    VIM:SendTouchEvent(7, 2, c.X, c.Y)
+                end)
+            end
+            pcall(function()
+                VIM:SendMouseButtonEvent(c.X, c.Y, 0, true, game, 1)
+                task.wait(0.03)
+                VIM:SendMouseButtonEvent(c.X, c.Y, 0, false, game, 1)
+            end)
+        elseif VU then
+            pcall(function()
+                VU:CaptureController()
+                VU:ClickButton1(c)
+            end)
+        end
+    end
+
+    local function hitRemote(t)
+        -- shape relatado: Attack(numero pequeno) / Hit(parte do alvo, {extras}).
+        -- as fontes recentes dizem que sem o id da sessao o server costuma
+        -- recusar; por isso ele e so UM dos metodos testados, nao o padrao.
+        Net.fire(Net.R.Attack, 0.5)
+        Net.fire(Net.R.Hit, t.hrp, {})
+    end
+
+    local function attack(method, t, tool)
+        if method == 1 then
+            hitRemote(t)
+        elseif method == 2 then
+            pressKey()
+        elseif method == 3 then
+            click()
+        elseif method == 4 then
+            if tool then pcall(function() tool:Activate() end) end
+        else
+            pressKey()
+            click()
+        end
+    end
+
+    -- testa cada metodo por ~2s no mob e fica com o que tirar mais vida
+    local function probe(t, tool)
+        local order = { 2, 3, 4, 1 }
+        local results, best, bestDmg = {}, nil, 0
+        local dmgOf = {}
+        for _, m in ipairs(order) do
+            if not (keep() and HUB.alive and Core.alive()) or hold.replan then return nil end
+            if not t.model.Parent or t.hum.Health <= 0 then break end
+            local hp0 = t.hum.Health
+            local t0 = os.clock()
+            while os.clock() - t0 < 2 and t.model.Parent and t.hum.Health > 0
+                and keep() and HUB.alive and not hold.replan do
+                aimAt(t)
+                attack(m, t, tool)
+                task.wait(math.max(0.15, CFG.AttackInterval))
+            end
+            local dmg = math.max(0, hp0 - t.hum.Health)
+            dmgOf[m] = dmg
+            table.insert(results, ATTACKS[m] .. " " .. math.floor(dmg))
+            if dmg > bestDmg then best, bestDmg = m, dmg end
+        end
+        -- skill tem cooldown: se o clique tambem bate, usa os dois juntos
+        if (dmgOf[2] or 0) > 0 and (dmgOf[3] or 0) > 0 then best = 5 end
+        if #results > 0 then
+            Core.log("teste de ataque: " .. table.concat(results, " | ")
+                .. (best and (" -> usando " .. ATTACKS[best]) or " -> NENHUM tirou vida"))
+        end
+        return best
+    end
+
+    function Feat.farmReprobe()
+        st.best = nil
+        st.reprobeAt = 0
+        Core.log("farm: vou testar os metodos de ataque de novo no proximo mob")
+    end
+
+    function Feat.farmStatus()
+        return st.status
+    end
+
+    -- ---------- passo principal (cuida de UM alvo e volta) ----------
     function Feat.farmStep()
-        if Feat.chestBusy or Feat.boatBusy then return end
-        local es = enemies()
-        local tgt = es[1]
-        if not tgt or tgt.dist > CFG.AttackRange then return end
-        equip()
-        local r = Core.root
-        if not r then return end
-        r.CFrame = tgt.hrp.CFrame * CFrame.new(0, 0, CFG.ApproachOffset)
-        -- shape observado: Attack(numero pequeno) / Hit(parte do alvo, {alvos extras}).
-        -- e a parte mais volatil do jogo: se nao bater, confirma no logger.
-        Net.fire(Net.R.Attack, 0.4)
-        Net.fire(Net.R.Hit, tgt.hrp, {})
+        if T.chest or Feat.boatBusy or Feat.fruitBusy then
+            Feat.farmStop()
+            if T.chest then warnOnce("chest", 20, "auto farm esperando: desliga o Auto Chest pra farmar") end
+            if Feat.boatBusy then warnOnce("boat", 20, "auto farm esperando: barco no ar") end
+            task.wait(0.5)
+            return
+        end
+        Feat.farmBusy = true
+        hold.replan = false
+        local now = os.clock()
+        for model, untilT in pairs(st.skip) do
+            if untilT < now or not model.Parent then st.skip[model] = nil end
+        end
+
+        -- 1) qual quest / qual mob
+        local q = chooseQuest()
+        local mob = nil
+        if type(CFG.FarmMob) == "string" and CFG.FarmMob ~= "" then
+            mob = CFG.FarmMob
+        elseif q then
+            mob = q.mob
+        end
+
+        -- 2) quest (so com o Auto Quest ligado)
+        if T.quest and q then manageQuest(q) end
+        if not keep() then return end
+
+        -- 3) alvo
+        local t = pickTarget(mob)
+        if not t then
+            if mob then
+                local pos = areaOf(mob)
+                if pos then
+                    st.status = "esperando " .. mob .. " nascer"
+                    local spot = pos + Vector3.new(0, CFG.FarmHover + 12, 0)
+                    local r = Core.root
+                    if r and (r.Position - spot).Magnitude > 20 then
+                        holdOn()
+                        Move.noclip("farm", true)
+                        holdClear()
+                        if Move.goTo(function() return spot end, CFG.FarmHop, CFG.FarmFlySpeed, keep) then
+                            hold.pos, hold.look = spot, nil
+                        end
+                    end
+                else
+                    st.status = "sem " .. mob .. " por aqui"
+                    warnOnce("nomob", 30, "farm: nao achei '" .. mob .. "' nesse mar (nem vivo, nem ponto de spawn)")
+                end
+            else
+                st.status = "sem mob por perto"
+                warnOnce("noany", 30, "farm: nenhum mob a menos de " .. tostring(CFG.AttackRange)
+                    .. " studs e nao sei tua quest - escreve o nome do mob na aba Farm")
+            end
+            task.wait(0.5)
+            return
+        end
+
+        -- 4) chegar (perto = pulo; longe = voo com anti-puxao)
+        holdOn()
+        Move.noclip("farm", true)
+        if t.dist > Move.hop(CFG.FarmHop) then
+            st.status = "indo ate " .. t.model.Name
+            holdClear()
+            local arrived = Move.fly(function()
+                if t.model.Parent and t.hum.Health > 0 then
+                    return t.hrp.Position + Vector3.new(0, CFG.FarmHover, 3)
+                end
+                return nil
+            end, Move.hop(CFG.FarmHop), CFG.FarmFlySpeed, keep)
+            if not arrived then
+                task.wait(0.1)
+                return
+            end
+        end
+
+        -- 5) bater ate morrer
+        local tool = equip()
+        local method = CFG.FarmAttack
+        if type(method) ~= "number" or method < 1 or method > #ATTACKS then
+            -- automatico: testa os metodos (de novo a cada 10 min, ou em 20s se nenhum funcionou)
+            if st.best == nil or os.clock() > st.reprobeAt then
+                st.status = "testando ataque em " .. t.model.Name
+                aimAt(t)
+                st.best = probe(t, tool)
+                st.reprobeAt = os.clock() + (st.best and 600 or 20)
+            end
+            method = st.best or 5
+        end
+        st.status = ("batendo em %s (%s)"):format(t.model.Name, ATTACKS[method] or "?")
+        local hp, lastDrop = t.hum.Health, os.clock()
+        while keep() and HUB.alive and Core.alive() and t.model.Parent and t.hum.Health > 0 do
+            if hold.replan then break end
+            aimAt(t)
+            attack(method, t, tool)
+            if t.hum.Health < hp - 0.5 then
+                hp = t.hum.Health
+                lastDrop = os.clock()
+            end
+            if os.clock() - lastDrop > 8 then
+                -- 8s batendo sem tirar vida: larga esse mob e re-testa o ataque
+                st.skip[t.model] = os.clock() + 20
+                if (type(CFG.FarmAttack) ~= "number" or CFG.FarmAttack < 1) and st.best ~= nil then
+                    st.best = nil
+                    st.reprobeAt = 0
+                end
+                warnOnce("nodmg", 10, "farm: 8s sem tirar vida de " .. t.model.Name
+                    .. " - trocando de alvo e testando o ataque de novo")
+                break
+            end
+            task.wait(CFG.AttackInterval)
+        end
+        if t.hum.Health <= 0 then
+            HUB.stats.kills = (HUB.stats.kills or 0) + 1
+        end
+    end
+
+    -- linhas pro Diagnostico
+    function Feat.farmInfo()
+        local out = {}
+        local lvl = playerLevel()
+        local sea = "mar desconhecido"
+        if game.PlaceId == SEA1 then sea = "Sea 1"
+        elseif game.PlaceId == SEA2 then sea = "Sea 2"
+        elseif game.PlaceId == SEA3 then sea = "Sea 3" end
+        table.insert(out, "level " .. tostring(lvl) .. " | " .. sea)
+        if not st.db then pcall(loadDB) end
+        table.insert(out, "quests: " .. tostring(st.dbSrc) .. " | NPCs: " .. (st.npcs and "sim" or "nao"))
+        local q = nil
+        pcall(function() q = chooseQuest() end)
+        if q then
+            table.insert(out, "quest do level: " .. tostring(q.id) .. " " .. tostring(q.tier)
+                .. " (" .. tostring(q.mob) .. ")")
+        else
+            table.insert(out, "quest do level: nenhuma")
+        end
+        local vis, title = questState()
+        local panel = "sem quest ativa"
+        if vis == nil then panel = "NAO ACHADO" elseif vis then panel = "quest ativa" end
+        if title ~= "" then panel = panel .. " | " .. string.sub(title, 1, 60) end
+        table.insert(out, "painel da quest: " .. panel)
+        local wo = workspace:FindFirstChild("_WorldOrigin")
+        local sp = wo and wo:FindFirstChild("EnemySpawns")
+        table.insert(out, "EnemySpawns: " .. (sp and (#sp:GetChildren() .. " pontos") or "NAO EXISTE"))
+        table.insert(out, "teclas virtuais: " .. (VIM and "sim" or "NAO") .. " | ataque escolhido: "
+            .. (st.best and ATTACKS[st.best] or "ainda nao testado"))
+        local tools = {}
+        local function scan(c)
+            if not c then return end
+            for _, tool in ipairs(c:GetChildren()) do
+                if tool:IsA("Tool") and #tools < 8 then
+                    table.insert(tools, tool.Name .. "[" .. tostring(tool.ToolTip) .. "]")
+                end
+            end
+        end
+        scan(Core.char)
+        scan(lp:FindFirstChild("Backpack"))
+        table.insert(out, "armas: " .. (#tools > 0 and table.concat(tools, ", ") or "nenhuma"))
+        return out
     end
 end
 
--- ---- 5.4 auto-quest ----
-local questMiss = 0
-function Feat.questStep()
-    if CFG.QuestGiverId == "" then return end
-    local gui = lp:FindFirstChild("PlayerGui")
-    local main = gui and gui:FindFirstChild("Main")
-    local tracker = main and main:FindFirstChild("Quest")
-    if not tracker then
-        -- caminho Main.Quest nao existe (update renomeou?): nao spamma StartQuest
-        questMiss += 1
-        if questMiss == 10 then
-            Core.log("tracker Main.Quest nao achado - auto-quest DESLIGADO (update?)")
-            T.quest = false
-        end
-        return
-    end
-    questMiss = 0
-    if not tracker.Visible then
-        Net.commf("StartQuest", CFG.QuestGiverId, CFG.QuestIndex)
+-- ---- 5.4 auto buso (haki) ----
+function Feat.busoStep()
+    local c = Core.char
+    if c and not c:FindFirstChild("HasBuso") then
+        Net.commf("Buso")
     end
 end
 
@@ -464,22 +1332,16 @@ function Feat.statStep()
     end
 end
 
--- ---- 5.6 coletor de bau v3 ----
--- Por que o dinheiro nao contava antes:
---   1) TP instantaneo + sair em 0.12s: o servidor nunca via teu personagem
---      encostado no bau (a posicao replica com atraso/ping), entao nao pagava.
---   2) StreamingEnabled: ao teleportar longe, a area ainda nao tinha carregado.
---      O bau que tu "pegava" era copia velha/descarregada -> nao renderizava.
---   3) Lista congelada: o loop usava uma foto antiga dos baus, entao ia em
---      bau que ja tinha sido pego/descarregado.
--- O que mudou:
---   - registro AO VIVO de baus (entra quando spawna/carrega, sai quando some)
---   - so vai em bau VIVO (no workspace, tocavel, visivel, com TouchInterest)
---   - pede pro jogo carregar a area antes de ir (RequestStreamAroundAsync)
---   - viaja suave numa velocidade fixa (sem TP gigante), com noclip
---   - fica no bau ATE O SERVIDOR PAGAR (Beli sobe) ou ate o tempo maximo
---   - detecta rubberband e diminui a velocidade sozinho
---   - bau que falha repetido vai pra lista de ignorados por um tempo
+-- ---- 5.6 coletor de bau ----
+-- Como funciona (tudo isso veio de log real + pesquisa):
+--   - registro AO VIVO dos baus (entra quando aparece, sai quando some)
+--   - pula bau desativado (ja pego, esperando renascer): tocar nele nunca paga
+--   - bau perto: pulo instantaneo. bau longe: voa e so pula no final
+--     (salto de ilha pra ilha num frame so o server recusa e nao paga)
+--   - fica colado no bau, re-tocando, ate o Beli subir de verdade
+--   - anti-puxao: se o server me tirar de cima do bau, recua em vez de brigar
+--   - bau que falha repetido fica de fora cada vez mais tempo; varios
+--     seguidos sem pagar = pausa de 30s
 do
     local RunSvc = game:GetService("RunService")
     local live      = {}  -- [touchPart] = chestInstance
@@ -692,39 +1554,20 @@ do
         return true
     end
 
-    -- VOO pra bau longe: anda ate la numa velocidade fixa em vez de pular.
-    -- Motivo (visto no log real): salto de ilha pra ilha num frame so o server
-    -- NAO aceita - o personagem dele continua na ilha antiga, a animacao do
-    -- bau toca so no teu celular e nenhum bau paga. Andando rapido ele aceita.
+    -- VOO pra bau longe (usa o Move: teto de velocidade + anti-puxao).
+    -- Voa ate faltar o "TP final" e o resto do caminho e pulo instantaneo.
     local function flyTo(p)
-        local r = Core.root
-        if not r or not isLive(p) then return false end
-        local cruiseY = math.max(r.Position.Y, p.Position.Y) + CFG.ChestFlyUp
-        local deadline = os.clock() + 120
-        while T.chest and HUB.alive and Core.alive() and isLive(p) do
-            local dt = RunSvc.Heartbeat:Wait()
-            r = Core.root
-            if not r then return false end
-            if os.clock() > deadline then
-                Core.log("voo estourou o tempo - pulando bau")
-                return false
-            end
-            local pos, goal = r.Position, p.Position
-            local flat = Vector3.new(goal.X - pos.X, 0, goal.Z - pos.Z).Magnitude
-            -- chegou na distancia do TP final: o resto do caminho e instantaneo
-            if (goal - pos).Magnitude <= math.max(CFG.ChestFarDist, 4) then return tpTo(p) end
-            if flat < 4 and math.abs(goal.Y - pos.Y) < 4 then return tpTo(p) end
-            -- longe: mira no ponto alto acima do bau; chegando: desce nele
-            local aim = (flat > 25) and Vector3.new(goal.X, cruiseY, goal.Z) or goal
-            local delta = aim - pos
-            local dist = delta.Magnitude
-            if dist > 0.01 then
-                local stepLen = math.min(dist, CFG.ChestFlySpeed * dt)
-                r.AssemblyLinearVelocity = Vector3.zero
-                r.CFrame = CFrame.new(pos + delta.Unit * stepLen)
-            end
-        end
-        return false
+        if not Core.root or not isLive(p) then return false end
+        local arrived = Move.fly(
+            function()
+                if isLive(p) then return p.Position end
+                return nil
+            end,
+            Move.hop(CFG.ChestFarDist), CFG.ChestFlySpeed,
+            function() return T.chest and not Feat.fruitBusy end,
+            CFG.ChestFlyUp)
+        if not arrived then return false end
+        return tpTo(p)
     end
 
     -- Fica colado no bau ate o server pagar (Beli sobe) ou estourar maxWait.
@@ -746,26 +1589,39 @@ do
             local r = Core.root
             if not r or not T.chest then break end
             local el = os.clock() - t0
-            if p.Parent then
-                local dev = (r.Position - p.Position).Magnitude
-                if dev > maxDev then maxDev = dev end
-                r.AssemblyLinearVelocity = Vector3.zero
-                r.CFrame = p.CFrame          -- cola em cima (o delayzin)
-            end
-            if el >= preTouch and os.clock() - lastTouch >= CFG.ChestRetouch then
-                if touching then touch(1) end
-                touch(0)
-                touching = true
-                lastTouch = os.clock()
-            end
+            -- 1) ja pagou? (confere antes de qualquer outra coisa)
             local now = beli()
             if before and now and now > before then paid = true end
             if not before and not isLive(p) then paid = true end
             -- so sai depois do delayzin minimo, pra garantir que replicou
             if paid and el >= CFG.ChestHold then break end
+            -- 2) posicao
+            if p.Parent then
+                if not paid then
+                    local dev = (r.Position - p.Position).Magnitude
+                    if dev > maxDev then maxDev = dev end
+                    -- ANTI-PUXAO: o server me tirou de cima do bau. nao brigo: saio
+                    -- do laco e o coletor recua (pulo menor, voo mais lento)
+                    if dev > 15 and el > 0.1 then break end
+                end
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = p.CFrame          -- cola em cima (o delayzin)
+            end
+            -- 3) toque (e re-toque)
+            if not paid and el >= preTouch and os.clock() - lastTouch >= CFG.ChestRetouch then
+                if touching then touch(1) end
+                touch(0)
+                touching = true
+                lastTouch = os.clock()
+            end
             RunSvc.Heartbeat:Wait()
         end
         if touching then touch(1) end
+        if not paid then
+            local now = beli()
+            if before and now and now > before then paid = true end
+        end
+        if paid then maxDev = 0 end
         return paid, os.clock() - t0, maxDev
     end
 
@@ -848,9 +1704,10 @@ do
         Feat.chestBusy = true
         setNoclip(true)
         local before = beli()
-        local far = jump > CFG.ChestFarDist
+        local hopMax = Move.hop(CFG.ChestFarDist)   -- encolhe sozinho depois de um puxao
+        local far = jump > hopMax
         -- tamanho do pulo instantaneo que o server vai julgar
-        local hop = (far and CFG.ChestFarMode == 2) and math.min(jump, CFG.ChestFarDist) or jump
+        local hop = (far and CFG.ChestFarMode == 2) and math.min(jump, hopMax) or jump
 
         -- 1) chegar. perto: TP instantaneo. longe: voo (ou TP, se voce trocar na aba Tune)
         local arrived
@@ -898,6 +1755,7 @@ do
 
         -- 3) nao pagou
         if not collected and T.chest and HUB.alive then
+            if dev > 15 then Move.pulled("bau", dev) end
             if took > 0 or isLive(target) then
                 HUB.stats.fails += 1
                 failStreak += 1
@@ -1038,8 +1896,18 @@ do
         -- velocidade horizontal: so o auto levi dirige. no "levantar" voce pilota.
         local driving = T.levi and not landing
         local hv = Vector3.zero
-        if driving and levi.state == "cruise" and levi.dir then
-            hv = levi.dir * CFG.LeviSpeed
+        -- ANTI-PUXAO do barco: se ele "pulou" bem mais do que eu mandei andar,
+        -- foi o server corrigindo. para 2s e segue mais devagar.
+        if driving and levi.lastPos then
+            local jumped = Vector3.new(pos.X - levi.lastPos.X, 0, pos.Z - levi.lastPos.Z).Magnitude
+            if jumped > math.max(30, CFG.LeviSpeed * dt * 4) then
+                Move.pulled("barco", jumped)
+                levi.pause = os.clock() + 2
+            end
+        end
+        levi.lastPos = pos
+        if driving and levi.state == "cruise" and levi.dir and os.clock() >= (levi.pause or 0) then
+            hv = levi.dir * (CFG.LeviSpeed * Move.scale)   -- mais devagar depois de puxao
             local flat = Vector3.new(pos.X - levi.legStart.X, 0, pos.Z - levi.legStart.Z).Magnitude
             local limit = (levi.phase == "out") and CFG.LeviOutDist or CFG.LeviLeg
             if flat >= limit then
@@ -1280,6 +2148,226 @@ do
     end
 end
 
+-- ---- 5.10 frutas no mapa: avisar / pegar / guardar ----
+do
+    local seen  = setmetatable({}, { __mode = "k" })   -- frutas que ja avisei
+    local tries = setmetatable({}, { __mode = "k" })   -- tentativas de pegar
+
+    local function isFruit(inst)
+        if not inst:IsA("Tool") then return false end
+        if inst:FindFirstChild("EatRemote") then return true end
+        return string.find(string.lower(inst.Name), "fruit", 1, true) ~= nil
+    end
+
+    local function fruitName(tool)
+        local n = nil
+        pcall(function() n = tool:GetAttribute("OriginalName") end)
+        if type(n) ~= "string" then
+            local v = tool:FindFirstChild("OriginalName")
+            if v and v:IsA("StringValue") then n = v.Value end
+        end
+        if type(n) == "string" and n ~= "" then return n end
+        return tool.Name
+    end
+
+    -- fruta largada por outro jogador: por padrao nao pego
+    local function wasDropped(tool)
+        local d = false
+        pcall(function()
+            d = tool:GetAttribute("DroppedBy") ~= nil or tool:FindFirstChild("DroppedBy") ~= nil
+        end)
+        return d
+    end
+
+    local function mine(tool)
+        if tool.Parent == nil or tool.Parent == workspace then return false end
+        if tool:IsDescendantOf(lp) then return true end
+        return Core.char ~= nil and tool:IsDescendantOf(Core.char)
+    end
+
+    local function grab(tool, handle)
+        Feat.fruitBusy = true
+        -- espera o farm / bau soltarem o personagem (eles checam fruitBusy)
+        local t0 = os.clock()
+        while (Feat.chestBusy or Feat.farmBusy) and os.clock() - t0 < 8 do
+            task.wait(0.2)
+        end
+        if not (Core.alive() and tool.Parent == workspace and handle.Parent) then return false end
+        Move.noclip("fruit", true)
+        local function keepFn()
+            return HUB.alive and T.fruitGrab and tool.Parent == workspace
+        end
+        local function goal()
+            if handle.Parent then return handle.Position end
+            return nil
+        end
+        if not Move.goTo(goal, 120, CFG.ChestFlySpeed, keepFn) then return false end
+        local t1 = os.clock()
+        while os.clock() - t1 < 2.5 and tool.Parent == workspace and HUB.alive do
+            local r = Core.root
+            if r and handle.Parent then
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = CFrame.new(handle.Position)
+                if firetouchinterest then
+                    pcall(function()
+                        firetouchinterest(r, handle, 0)
+                        firetouchinterest(r, handle, 1)
+                    end)
+                end
+            end
+            task.wait(0.15)
+        end
+        if not mine(tool) then return false end
+        local name = fruitName(tool)
+        Core.log("fruta pega: " .. name)
+        Feat.notify("BF HUB", "Peguei: " .. name)
+        if T.fruitStore then
+            pcall(function()
+                if Core.hum then Core.hum:UnequipTools() end
+            end)
+            task.wait(0.3)
+            -- shape relatado (varia entre fontes): StoreFruit, nome interno, a Tool
+            local okS, res = Net.commf("StoreFruit", name, tool)
+            Core.log("guardar fruta -> " .. (okS and Core.fmt(res) or "remote falhou"))
+        end
+        return true
+    end
+
+    task.spawn(function()
+        while HUB.alive do
+            task.wait(3)
+            if (T.fruit or T.fruitGrab) and Core.alive() then
+                local r = Core.root
+                for _, c in ipairs(workspace:GetChildren()) do
+                    if isFruit(c) then
+                        local h = c:FindFirstChild("Handle")
+                        if h and h:IsA("BasePart") then
+                            local dropped = wasDropped(c)
+                            if not seen[c] then
+                                seen[c] = true
+                                local d = r and math.floor((h.Position - r.Position).Magnitude) or 0
+                                local msg = "FRUTA no mapa: " .. fruitName(c) .. " (" .. d .. " studs)"
+                                    .. (dropped and " [largada por jogador]" or "")
+                                Core.log(msg)
+                                Feat.notify("BF HUB", msg)
+                            end
+                            if T.fruitGrab and not dropped and not Feat.boatBusy
+                                and (tries[c] or 0) < 3 and c.Parent == workspace then
+                                tries[c] = (tries[c] or 0) + 1
+                                local okG, res = pcall(grab, c, h)
+                                Feat.fruitBusy = false
+                                Move.noclip("fruit", false)
+                                if not okG then
+                                    Core.log("erro pegando fruta: " .. tostring(res))
+                                elseif not res then
+                                    Core.log("nao consegui pegar a fruta (tentativa " .. tries[c] .. "/3)")
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- ---- 5.11 avisos: ilhas/eventos e lua cheia ----
+do
+    local was = {}
+    local moonWas = false
+    task.spawn(function()
+        while HUB.alive do
+            task.wait(5)
+            if T.watch then
+                local map = workspace:FindFirstChild("Map")
+                if map and type(CFG.WatchNames) == "table" then
+                    for _, name in ipairs(CFG.WatchNames) do
+                        local here = map:FindFirstChild(name) ~= nil
+                        if here and not was[name] then
+                            Core.log("EVENTO: " .. tostring(name) .. " apareceu no mapa")
+                            Feat.notify("BF HUB", tostring(name) .. " apareceu!")
+                        end
+                        was[name] = here
+                    end
+                end
+                local full = false
+                pcall(function()
+                    local sky = game:GetService("Lighting"):FindFirstChildOfClass("Sky")
+                    if sky then
+                        full = string.find(sky.MoonTextureId, "9709149431", 1, true) ~= nil
+                    end
+                end)
+                if full and not moonWas then
+                    Core.log("EVENTO: lua cheia")
+                    Feat.notify("BF HUB", "Lua cheia!")
+                end
+                moonWas = full
+            end
+        end
+    end)
+end
+
+-- ---- 5.12 desempenho: fps boost e tela branca ----
+do
+    local RunSvc = game:GetService("RunService")
+    local whiteOn = false
+
+    function Feat.fpsBoost()
+        local Lighting = game:GetService("Lighting")
+        local n = 0
+        pcall(function() Lighting.GlobalShadows = false end)
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+        for _, e in ipairs(Lighting:GetChildren()) do
+            if e:IsA("PostEffect") then
+                pcall(function() e.Enabled = false end)
+                n += 1
+            end
+        end
+        local all = workspace:GetDescendants()
+        for i, d in ipairs(all) do
+            if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam")
+                or d:IsA("Smoke") or d:IsA("Fire") or d:IsA("Sparkles") then
+                pcall(function() d.Enabled = false end)
+                n += 1
+            end
+            if i % 3000 == 0 then task.wait() end
+        end
+        Core.log("fps boost: " .. n .. " efeitos desligados (pra voltar ao normal, reentra no jogo)")
+    end
+
+    -- tela branca: desliga o desenho 3D (o hub continua aparecendo). bom pra AFK.
+    task.spawn(function()
+        while HUB.alive do
+            local want = T.white and true or false
+            if want ~= whiteOn then
+                whiteOn = want
+                pcall(function() RunSvc:Set3dRenderingEnabled(not whiteOn) end)
+                Core.log(whiteOn and "tela branca LIGADA (economia de bateria)" or "tela normal de volta")
+            end
+            task.wait(0.5)
+        end
+        if whiteOn then
+            pcall(function() RunSvc:Set3dRenderingEnabled(true) end)
+        end
+    end)
+end
+
+-- ---- 5.13 consultas rapidas por remote (so leem / so agem quando VOCE aperta) ----
+function Feat.eliteCheck()
+    local ok, res = Net.commf("EliteHunter")
+    Core.log("elite hunter -> " .. (ok and Core.fmt(res) or "remote falhou"))
+end
+
+function Feat.gachaCheck()
+    local ok, res = Net.commf("Cousin", "Check")
+    Core.log("gacha (checar) -> " .. (ok and Core.fmt(res) or "remote falhou"))
+end
+
+function Feat.gachaBuy()
+    local ok, res = Net.commf("Cousin", "Buy")
+    Core.log("gacha (comprar) -> " .. (ok and Core.fmt(res) or "remote falhou"))
+end
+
 -- ---- 5.9 diagnostico: joga no Log tudo que o hub precisa saber do jogo ----
 -- Um toque e eu paro de chutar nome de pasta/remote: manda o resultado no chat.
 function Feat.diagnose()
@@ -1299,6 +2387,22 @@ function Feat.diagnose()
     Net.resolve()
     L("remotes CommF:" .. yn(Net.R.CommF) .. " Attack:" .. yn(Net.R.Attack)
         .. " Hit:" .. yn(Net.R.Hit) .. " Browser:" .. yn(Net.R.Browser))
+
+    if Feat.farmInfo then
+        local okF, lines = pcall(Feat.farmInfo)
+        if okF and type(lines) == "table" then
+            for _, ln in ipairs(lines) do L(ln) end
+        else
+            L("farm info: erro -> " .. tostring(lines))
+        end
+    end
+    L(("anti-puxao: %d puxoes | velocidade %d%% | pulo %d%%"):format(
+        Move.pulls, math.floor(Move.scale * 100), math.floor(Move.hopScale * 100)))
+    local loose = 0
+    for _, c in ipairs(workspace:GetChildren()) do
+        if c:IsA("Tool") then loose += 1 end
+    end
+    L("tools soltas no workspace (frutas): " .. loose)
 
     if Feat.chestInfo then
         local ok, total, alive, withTI, tagged, coin, off = pcall(Feat.chestInfo)
@@ -1328,11 +2432,6 @@ function Feat.diagnose()
         end
     end
     L("pastas com mobs/npcs: " .. (#cands > 0 and table.concat(cands, ", ") or "nenhuma"))
-
-    local pg = lp:FindFirstChild("PlayerGui")
-    local mainGui = pg and pg:FindFirstChild("Main")
-    local q = mainGui and mainGui:FindFirstChild("Quest")
-    L("tracker Main.Quest: " .. yn(q))
 
     local bf = workspace:FindFirstChild(CFG.BoatFolder)
     L("pasta barcos '" .. CFG.BoatFolder .. "': " .. (bf and (#bf:GetChildren() .. " barcos") or "NAO EXISTE"))
@@ -1370,22 +2469,41 @@ end
 -- ============================================================
 -- 6. SCHEDULER (um loop, intervalos por feature)
 -- ============================================================
+-- stat / buso: coisas leves, de tempos em tempos
 task.spawn(function()
     local tick = 0
     while HUB.alive do
         if Core.alive() then
-            if T.farm  then pcall(Feat.farmStep) end
-            if tick % 12 == 0 and T.quest then pcall(Feat.questStep) end
-            if tick % 20 == 0 and T.stat  then pcall(Feat.statStep)  end
+            if tick % 10 == 0 and T.stat then pcall(Feat.statStep) end
+            if tick % 10 == 5 and T.buso then pcall(Feat.busoStep) end
         end
         tick += 1
-        task.wait(CFG.AttackInterval)
+        task.wait(0.5)
     end
+end)
+
+-- auto farm: cada passo cuida de um alvo
+task.spawn(function()
+    while HUB.alive do
+        if T.farm and Core.alive() then
+            local ok, err = pcall(Feat.farmStep)
+            if not ok then
+                pcall(Feat.farmStop)
+                Core.log("erro no farm: " .. tostring(err))
+                task.wait(1)
+            end
+            task.wait()
+        else
+            pcall(Feat.farmStop)
+            task.wait(0.4)
+        end
+    end
+    pcall(Feat.farmStop)
 end)
 
 task.spawn(function()
     while HUB.alive do
-        if T.chest and Core.alive() and not Feat.boatBusy then
+        if T.chest and Core.alive() and not Feat.boatBusy and not Feat.fruitBusy then
             local ok, err = pcall(Feat.chestStep)
             if not ok then
                 pcall(Feat.chestStop)   -- solta busy E noclip
@@ -1436,6 +2554,7 @@ local function buildGui()
     win.Position = UDim2.fromScale(0.03, 0.18)
     win.BackgroundColor3 = COL.bg; win.BackgroundTransparency = 0.05
     Instance.new("UICorner", win).CornerRadius = UDim.new(0, 12)
+    HUB._win = win
 
     -- header + drag + minimize
     local header = Instance.new("TextLabel", win)
@@ -1476,11 +2595,16 @@ local function buildGui()
         end)
     end
 
-    -- abas
-    local tabs = Instance.new("Frame", body)
-    tabs.Size = UDim2.new(1,0,0,28); tabs.BackgroundTransparency = 1
+    -- abas: barra que rola pro lado (arrasta pra ver as outras)
+    local TAB_ORDER = { Main = 1, Farm = 2, Boat = 3, Extra = 4, Tune = 5, Custom = 6, Log = 7 }
+    local tabs = Instance.new("ScrollingFrame", body)
+    tabs.Size = UDim2.new(1,0,0,30); tabs.BackgroundTransparency = 1
+    tabs.BorderSizePixel = 0; tabs.ScrollBarThickness = 0
+    tabs.ScrollingDirection = Enum.ScrollingDirection.X
+    tabs.CanvasSize = UDim2.new(); tabs.AutomaticCanvasSize = Enum.AutomaticSize.X
     local tl = Instance.new("UIListLayout", tabs)
     tl.FillDirection = Enum.FillDirection.Horizontal; tl.Padding = UDim.new(0,4)
+    tl.SortOrder = Enum.SortOrder.LayoutOrder
 
     local pages = Instance.new("Frame", body)
     pages.Size = UDim2.new(1,0,1,-32); pages.Position = UDim2.fromOffset(0,32)
@@ -1490,7 +2614,8 @@ local function buildGui()
     local tabBtns = {}
     local function addTab(name)
         local btn = Instance.new("TextButton", tabs)
-        btn.Size = UDim2.fromOffset(49,28); btn.Text = name
+        btn.Size = UDim2.fromOffset(54,28); btn.Text = name
+        btn.LayoutOrder = TAB_ORDER[name] or 99
         btn.BackgroundColor3 = COL.panel; btn.TextColor3 = COL.txt
         btn.Font = Enum.Font.GothamMedium; btn.TextSize = 11
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0,6)
@@ -1528,6 +2653,16 @@ local function buildGui()
             paint()
             Core.save()
         end)
+    end
+
+    local function mkAction(page, text, cb)
+        local b = Instance.new("TextButton", page)
+        b.Size = UDim2.fromOffset(210,30); b.BackgroundColor3 = COL.accent
+        b.Text = text; b.TextColor3 = COL.txt
+        b.Font = Enum.Font.GothamMedium; b.TextSize = 13
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
+        b.MouseButton1Click:Connect(function() cb(b) end)
+        return b
     end
 
     local function mkSlider(page, label, cfgKey, min, max, step)
@@ -1578,14 +2713,16 @@ local function buildGui()
     local main = addTab("Main")
     do
         local st = Instance.new("TextLabel", main)
-        st.Size = UDim2.fromOffset(210,22); st.BackgroundColor3 = COL.panel
+        st.Size = UDim2.fromOffset(210,34); st.BackgroundColor3 = COL.panel
+        st.TextWrapped = true
         st.TextColor3 = COL.txt; st.Font = Enum.Font.Gotham; st.TextSize = 12
         st.LayoutOrder = -1
         Instance.new("UICorner", st).CornerRadius = UDim.new(0,8)
         local function paint()
             local d = HUB.stats or {}
-            st.Text = ("baus %d | beli %d | falhas %d"):format(
-                math.floor(d.chests or 0), math.floor(d.beli or 0), math.floor(d.fails or 0))
+            st.Text = ("baus %d | beli %d | kills %d | puxoes %d"):format(
+                math.floor(d.chests or 0), math.floor(d.beli or 0),
+                math.floor(d.kills or 0), math.floor(Move.pulls or 0))
         end
         paint()
         -- 1x por segundo e so com a aba aberta
@@ -1600,6 +2737,7 @@ local function buildGui()
     mkToggle(main, "Auto Quest", "quest")
     mkToggle(main, "Auto Chest", "chest")
     mkToggle(main, "Auto Stat", "stat")
+    mkToggle(main, "Auto Buso (haki)", "buso")
     mkToggle(main, "Anti-Idle", "idle")
     do
         local hop = Instance.new("TextButton", main)
@@ -1624,12 +2762,87 @@ local function buildGui()
         end)
     end
 
-    -- aba TUNE (sliders)
+    -- aba FARM
+    local farmTab = addTab("Farm")
+    do
+        local status = Instance.new("TextLabel", farmTab)
+        status.Size = UDim2.fromOffset(210, 34); status.BackgroundColor3 = COL.panel
+        status.TextColor3 = COL.txt; status.Font = Enum.Font.Gotham; status.TextSize = 12
+        status.TextWrapped = true
+        status.Text = "farm: parado"
+        Instance.new("UICorner", status).CornerRadius = UDim.new(0,8)
+        -- 2x por segundo e so com a aba aberta
+        task.spawn(function()
+            while HUB.alive and status.Parent do
+                if farmTab.Visible and Feat.farmStatus then
+                    status.Text = "farm: " .. tostring(Feat.farmStatus())
+                end
+                task.wait(0.5)
+            end
+        end)
+
+        local function mkBox(placeholder, cfgKey, lettersOnly)
+            local box = Instance.new("TextBox", farmTab)
+            box.Size = UDim2.fromOffset(210,28); box.PlaceholderText = placeholder
+            box.Text = tostring(CFG[cfgKey] or ""); box.ClearTextOnFocus = false
+            box.BackgroundColor3 = COL.panel; box.TextColor3 = COL.txt
+            box.Font = Enum.Font.Gotham; box.TextSize = 12
+            Instance.new("UICorner", box).CornerRadius = UDim.new(0,8)
+            box.FocusLost:Connect(function()
+                local v = (string.gsub(box.Text, "^%s+", ""))
+                v = (string.gsub(v, "%s+$", ""))
+                if lettersOnly then v = string.upper((string.gsub(v, "[^%a]", ""))) end
+                CFG[cfgKey] = v
+                box.Text = v
+                Core.save()
+                Core.log(cfgKey .. " = '" .. v .. "'")
+            end)
+        end
+
+        mkBox("mob (vazio = quest do teu level)", "FarmMob", false)
+
+        local function atkName()
+            local m = CFG.FarmAttack
+            if type(m) ~= "number" or m < 1 then return "Ataque: auto (testa sozinho)" end
+            return "Ataque: " .. (Feat.farmAttacks[m] or "auto")
+        end
+        mkAction(farmTab, atkName(), function(b)
+            local m = (type(CFG.FarmAttack) == "number") and CFG.FarmAttack or 0
+            CFG.FarmAttack = (m + 1) % (#Feat.farmAttacks + 1)
+            b.Text = atkName(); Core.save()
+        end)
+        local function wepName()
+            return "Arma: " .. (Feat.farmWeapons[CFG.FarmWeapon] or "qualquer")
+        end
+        mkAction(farmTab, wepName(), function(b)
+            local w = (type(CFG.FarmWeapon) == "number") and CFG.FarmWeapon or 1
+            CFG.FarmWeapon = (w % #Feat.farmWeapons) + 1
+            b.Text = wepName(); Core.save()
+        end)
+        mkAction(farmTab, "Testar ataque de novo", function() Feat.farmReprobe() end)
+        mkBox("teclas de skill (ex: ZXC)", "FarmKeys", true)
+        mkSlider(farmTab, "Altura em cima do mob", "FarmHover", 0, 60, 1)
+        mkSlider(farmTab, "Pulo instantaneo ate", "FarmHop", 40, 400, 10)
+        mkSlider(farmTab, "Voo (velocidade)", "FarmFlySpeed", 100, 350, 10)
+        mkSlider(farmTab, "Intervalo do ataque", "AttackInterval", 0.05, 1, 0.05)
+        mkSlider(farmTab, "Alcance sem quest", "AttackRange", 100, 600, 10)
+    end
+
+    -- aba EXTRA
+    local extra = addTab("Extra")
+    mkToggle(extra, "Avisar fruta", "fruit")
+    mkToggle(extra, "Pegar fruta", "fruitGrab")
+    mkToggle(extra, "Guardar fruta", "fruitStore")
+    mkToggle(extra, "Avisar eventos / lua", "watch")
+    mkToggle(extra, "Tela branca (AFK)", "white")
+    mkAction(extra, "FPS Boost", function() task.spawn(Feat.fpsBoost) end)
+    mkAction(extra, "Elite Hunter (consultar)", function() task.spawn(Feat.eliteCheck) end)
+    mkAction(extra, "Gacha: consultar", function() task.spawn(Feat.gachaCheck) end)
+    mkAction(extra, "Gacha: comprar (gasta beli)", function() task.spawn(Feat.gachaBuy) end)
+
+    -- aba TUNE (ajustes finos do bau)
     local tune = addTab("Tune")
-    mkSlider(tune, "Attack Range", "AttackRange", 100, 600, 10)
-    mkSlider(tune, "Attack Interval", "AttackInterval", 0.05, 1, 0.05)
     mkSlider(tune, "Chest Hold (delay)", "ChestHold", 0.05, 0.6, 0.01)
-    mkSlider(tune, "Chest Stream Wait", "ChestStreamWait", 0.5, 4, 0.1)
     mkSlider(tune, "Chest Max Wait", "ChestMaxWait", 0.3, 2.0, 0.1)
     do
         local names = { "tp", "voo" }
@@ -1649,7 +2862,6 @@ local function buildGui()
     mkSlider(tune, "Espera bau longe", "ChestFarWait", 1, 4, 0.1)
     mkSlider(tune, "Call Cooldown", "CallCooldown", 0.05, 0.5, 0.01)
 
-    -- aba CUSTOM (verbos logados)
     -- aba BOAT (levantar + velocidade + auto leviathan)
     local boatTab = addTab("Boat")
     do
@@ -1716,6 +2928,7 @@ local function buildGui()
         mkSlider(boatTab, "Perna da patrulha", "LeviLeg", 500, 6000, 250)
     end
 
+    -- aba CUSTOM (verbos do CommF_)
     local custom = addTab("Custom")
     do
         local box = Instance.new("TextBox", custom)
@@ -1809,6 +3022,56 @@ local function buildGui()
     main.Visible = true
     if tabBtns.Main then tabBtns.Main.BackgroundColor3 = COL.accent end
 
+    -- animacao de entrada: o nome aparece, some, e a janela "salta" pro lugar.
+    -- roda uma vez so (nao pesa); se qualquer tween falhar a janela aparece igual.
+    do
+        local TweenSvc = game:GetService("TweenService")
+        local scale = Instance.new("UIScale", win)
+        scale.Scale = 0.6
+        win.Visible = false
+
+        local splash = Instance.new("TextLabel", sg)
+        splash.AnchorPoint = Vector2.new(0.5, 0.5)
+        splash.Position = UDim2.fromScale(0.5, 0.45)
+        splash.Size = UDim2.fromOffset(280, 60)
+        splash.BackgroundTransparency = 1
+        splash.Text = "BF AFK HUB"
+        splash.Font = Enum.Font.GothamBlack; splash.TextSize = 34
+        splash.TextColor3 = COL.txt; splash.TextTransparency = 1
+        local stroke = Instance.new("UIStroke", splash)
+        stroke.Color = COL.accent; stroke.Thickness = 2; stroke.Transparency = 1
+        local sub = Instance.new("TextLabel", splash)
+        sub.AnchorPoint = Vector2.new(0.5, 0)
+        sub.Position = UDim2.new(0.5, 0, 1, -6)
+        sub.Size = UDim2.fromOffset(280, 18)
+        sub.BackgroundTransparency = 1
+        sub.Text = "carregando..."
+        sub.Font = Enum.Font.Gotham; sub.TextSize = 13
+        sub.TextColor3 = COL.txt; sub.TextTransparency = 1
+
+        task.spawn(function()
+            pcall(function()
+                local tin = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                TweenSvc:Create(splash, tin, { TextTransparency = 0 }):Play()
+                TweenSvc:Create(stroke, tin, { Transparency = 0 }):Play()
+                TweenSvc:Create(sub, tin, { TextTransparency = 0.3 }):Play()
+                task.wait(0.9)
+                local tout = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+                TweenSvc:Create(splash, tout, { TextTransparency = 1, Position = UDim2.fromScale(0.5, 0.40) }):Play()
+                TweenSvc:Create(stroke, tout, { Transparency = 1 }):Play()
+                TweenSvc:Create(sub, tout, { TextTransparency = 1 }):Play()
+                task.wait(0.3)
+            end)
+            pcall(function() splash:Destroy() end)
+            win.Visible = true
+            local okT = pcall(function()
+                TweenSvc:Create(scale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+                    { Scale = 1 }):Play()
+            end)
+            if not okT then scale.Scale = 1 end
+        end)
+    end
+
     -- keybind toggle da janela
     UIS.InputBegan:Connect(function(i, gpe)
         if gpe then return end
@@ -1825,6 +3088,11 @@ if type(CFG.BoatMethod) ~= "number" or CFG.BoatMethod < 1 or CFG.BoatMethod > 3 
 if type(CFG.SpeedMethod) ~= "number" or CFG.SpeedMethod < 1 or CFG.SpeedMethod > 2 then CFG.SpeedMethod = 1 end
 if CFG.ChestFarMode ~= 1 and CFG.ChestFarMode ~= 2 then CFG.ChestFarMode = 2 end
 if CFG.LeviDirMode ~= 1 and CFG.LeviDirMode ~= 2 then CFG.LeviDirMode = 2 end
+T.white = false                                    -- nunca abre com a tela branca
+if type(CFG.FarmAttack) ~= "number" or CFG.FarmAttack < 0 or CFG.FarmAttack > 5 then CFG.FarmAttack = 0 end
+if type(CFG.FarmWeapon) ~= "number" or CFG.FarmWeapon < 1 or CFG.FarmWeapon > 5 then CFG.FarmWeapon = 1 end
+if type(CFG.FarmMob) ~= "string" then CFG.FarmMob = "" end
+if type(CFG.FarmKeys) ~= "string" or CFG.FarmKeys == "" then CFG.FarmKeys = "ZXC" end
 do  -- config salva antiga ganha os nomes novos (LeviathanGate fica em workspace.Map)
     local function ensure(list, value)
         if type(list) ~= "table" then return end
