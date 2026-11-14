@@ -8,8 +8,10 @@
 ABAS (a barra de abas rola pro lado)
   Main   - Auto Farm, Auto Quest, Auto Chest, Auto Stat, Auto Buso,
            Anti-Idle, Hop Server manual, PARAR TUDO
-  Farm   - mob (vazio = quest do teu level), metodo de ataque, arma,
-           altura, velocidade
+  Farm   - mob (vazio = quest do teu level), PUXAR MOBS + killaura
+           por remote, metodo de ataque, arma, altura, velocidade
+  Mast.  - farm de MAESTRIA: metodo Cake / Bone / Chocolate / Level,
+           ALL Boss do teu mar, skill segurada (Dragon C), M1 remote
   Boat   - Boat Speed, Levantar Barco, Auto Leviathan
   Extra  - avisar/pegar/guardar fruta, avisos de evento e lua cheia,
            tela branca, FPS boost, elite, gacha
@@ -77,6 +79,20 @@ local DEFAULTS = {
     FarmKeys        = "ZXC",     -- teclas de skill do metodo "tecla"
     FarmWeapon      = 1,         -- 1 qualquer | 2 Melee | 3 Sword | 4 Blox Fruit | 5 Gun
     FarmSetSpawn    = true,      -- salva o spawn perto do NPC da quest (morreu, volta ali)
+    MagnetRange     = 250,       -- puxa mob NASCIDO a ate essa distancia da pilha (leash da area)
+    MagnetStack     = 6,         -- quantos mobs no maximo na pilha
+
+    -- farm de maestria
+    MasteryMethod   = 1,         -- 1 Cake | 2 Bone | 3 Chocolate | 4 Level
+    MasteryWeapon   = 1,         -- 1 fruta | 2 gun (quem da o golpe final leva a maestria)
+    MasterySwapHP   = 20,        -- troca pra fruta/gun quando o mob chega nessa % de vida
+    MastM1          = true,      -- soco (M1) da fruta por REMOTE na finalizacao
+    -- skills na finalizacao: 1 off | 2 toque | 3 segura 1s | 4 segura 2s | 5 segura 3s
+    MastSkillZ      = 4,         -- Dragon Z: segurar aumenta alcance/dano
+    MastSkillX      = 1,         -- X move o personagem: off por padrao
+    MastSkillC      = 5,         -- Dragon C: PRECISA segurar (teu caso)
+    MastSkillV      = 2,
+    MastSkillF      = 1,         -- F e voo: off
 
     -- avisos (filhos de workspace.Map que valem um aviso quando aparecem)
     WatchNames      = { "MysticIsland", "LeviathanGate", "KitsuneIsland", "PrehistoricIsland" },
@@ -143,7 +159,8 @@ HUB.alive = true
 HUB.toggles = { farm = false, quest = true, chest = false, stat = false, idle = true,
                 lift = false, levi = false, speed = false,
                 buso = false, fruit = false, fruitGrab = false, fruitStore = false,
-                watch = false, white = false }
+                watch = false, white = false, magnet = false,
+                mastery = false, mastboss = false, mastmagnet = false }
 HUB.config  = table.clone(DEFAULTS)
 HUB.custom  = {}   -- { {name=, verb=, args={}} }
 
@@ -870,6 +887,7 @@ do
         holdClear()
         hold.replan = false
         if holdConn then holdConn:Disconnect(); holdConn = nil end
+        if Feat.Mag then pcall(Feat.Mag.release) end
         Move.noclip("farm", false)
         Feat.farmBusy = false
     end
@@ -1231,7 +1249,9 @@ do
         -- 5) bater ate morrer
         local tool = equip()
         local method = CFG.FarmAttack
-        if type(method) ~= "number" or method < 1 or method > #ATTACKS then
+        if T.magnet then
+            method = 1   -- com magnet o ataque e sempre o remote (killaura na pilha)
+        elseif type(method) ~= "number" or method < 1 or method > #ATTACKS then
             -- automatico: testa os metodos (de novo a cada 10 min, ou em 20s se nenhum funcionou)
             if st.best == nil or os.clock() > st.reprobeAt then
                 st.status = "testando ataque em " .. t.model.Name
@@ -1242,11 +1262,24 @@ do
             method = st.best or 5
         end
         st.status = ("batendo em %s (%s)"):format(t.model.Name, ATTACKS[method] or "?")
+        local magAnchor = nil
+        if T.magnet and Feat.Mag then
+            -- a pilha fica onde os mobs NASCERAM (fora da area eles nao tomam dano)
+            magAnchor = Feat.Mag.areaOf(t.model) or t.hrp.Position
+        end
         local hp, lastDrop = t.hum.Health, os.clock()
         while keep() and HUB.alive and Core.alive() and t.model.Parent and t.hum.Health > 0 do
             if hold.replan then break end
-            aimAt(t)
-            attack(method, t, tool)
+            if magAnchor and T.magnet then
+                local pile = Feat.Mag.update(mob or baseName(t.model.Name), magAnchor)
+                Feat.Mag.kill(pile)
+                st.status = ("killaura: %d mob(s) na pilha"):format(#pile)
+                hold.pos = magAnchor + Vector3.new(0, CFG.FarmHover, 3)
+                hold.look = magAnchor
+            else
+                aimAt(t)
+                attack(method, t, tool)
+            end
             if t.hum.Health < hp - 0.5 then
                 hp = t.hum.Health
                 lastDrop = os.clock()
@@ -1296,6 +1329,8 @@ do
         local wo = workspace:FindFirstChild("_WorldOrigin")
         local sp = wo and wo:FindFirstChild("EnemySpawns")
         table.insert(out, "EnemySpawns: " .. (sp and (#sp:GetChildren() .. " pontos") or "NAO EXISTE"))
+        table.insert(out, "magnet: sethiddenproperty " .. (sethiddenproperty and "sim" or "NAO")
+            .. " | alcance " .. tostring(CFG.MagnetRange) .. " | pilha " .. tostring(CFG.MagnetStack))
         table.insert(out, "teclas virtuais: " .. (VIM and "sim" or "NAO") .. " | ataque escolhido: "
             .. (st.best and ATTACKS[st.best] or "ainda nao testado"))
         local tools = {}
@@ -1311,6 +1346,470 @@ do
         scan(lp:FindFirstChild("Backpack"))
         table.insert(out, "armas: " .. (#tools > 0 and table.concat(tools, ", ") or "nenhuma"))
         return out
+    end
+end
+
+-- ---- 5.3b magnet + killaura (so por REMOTE) ----
+-- Puxa os mobs da MESMA AREA pra uma pilha e bate em todos de uma vez pelo
+-- RegisterHit (parte principal + lista de extras). Regras da pesquisa:
+--   - so da pra mover mob que TEU cliente simula: SimulationRadius alto
+--   - mob arrastado pra fora da area dele PARA de tomar dano (leash), entao
+--     a pilha fica onde os mobs nasceram, nao onde voce esta
+--   - a area "real" e onde o mob foi visto pela 1a vez (depois do magnet a
+--     posicao atual mente)
+--   - mob 4s na pilha sem perder vida e solto por 25s (nao e nosso / leash)
+do
+    local Mag = { held = {} }
+    Feat.Mag = Mag
+    local firstSeen = setmetatable({}, { __mode = "k" })
+    local hpSeen    = setmetatable({}, { __mode = "k" })
+    local badUntil  = setmetatable({}, { __mode = "k" })
+    local simOn = false
+
+    local function base(name)
+        return (string.gsub(name, "%s*%[.-%]%s*$", ""))
+    end
+
+    -- anota onde cada mob nasceu (1a vez que aparece)
+    task.spawn(function()
+        while HUB.alive do
+            task.wait(2)
+            if T.magnet or T.farm or T.mastery or T.mastboss then
+                for _, fname in ipairs(CFG.EnemyFolders) do
+                    local f = workspace:FindFirstChild(fname)
+                    if f then
+                        for _, e in ipairs(f:GetChildren()) do
+                            if firstSeen[e] == nil then
+                                local hr = e:FindFirstChild("HumanoidRootPart")
+                                if hr then firstSeen[e] = hr.Position end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    local function simRadius()
+        if simOn then return end
+        simOn = true
+        task.spawn(function()
+            while HUB.alive and (T.magnet or T.mastmagnet) do
+                pcall(function()
+                    if sethiddenproperty then
+                        sethiddenproperty(lp, "SimulationRadius", 1e4)
+                        sethiddenproperty(lp, "MaxSimulationRadius", 1e4)
+                    end
+                end)
+                task.wait(1)
+            end
+            simOn = false
+        end)
+    end
+
+    function Mag.areaOf(model)
+        return firstSeen[model]
+    end
+
+    -- junta os mobs da especie na pilha; devolve a lista dos que estao nela
+    function Mag.update(mobName, anchor)
+        simRadius()
+        local now = os.clock()
+        local held = {}
+        for _, fname in ipairs(CFG.EnemyFolders) do
+            local f = workspace:FindFirstChild(fname)
+            if f then
+                for _, e in ipairs(f:GetChildren()) do
+                    if #held >= CFG.MagnetStack then break end
+                    local nm = base(e.Name)
+                    local hit
+                    if type(mobName) == "table" then hit = mobName[nm] else hit = (nm == mobName) end
+                    if (badUntil[e] or 0) < now and hit then
+                        local h  = e:FindFirstChildWhichIsA("Humanoid")
+                        local hr = e:FindFirstChild("HumanoidRootPart")
+                        local born = firstSeen[e]
+                        if h and hr and h.Health > 0 and born
+                            and (born - anchor).Magnitude <= CFG.MagnetRange then
+                            table.insert(held, { model = e, hum = h, hrp = hr })
+                        end
+                    end
+                end
+            end
+        end
+        -- escreve a pilha em circulo e vigia se cada um ainda toma dano
+        for i, m in ipairs(held) do
+            local ang = i * (math.pi * 2 / #held)
+            local off = Vector3.new(math.cos(ang) * 2.5, 0, math.sin(ang) * 2.5)
+            pcall(function()
+                m.hrp.AssemblyLinearVelocity = Vector3.zero
+                m.hrp.CFrame = CFrame.new(anchor + off)
+            end)
+            local seen = hpSeen[m.model]
+            if not seen or m.hum.Health < seen.hp - 0.5 then
+                hpSeen[m.model] = { hp = m.hum.Health, t = now }
+            elseif now - seen.t > 4 then
+                badUntil[m.model] = now + 25
+                hpSeen[m.model] = nil
+            end
+        end
+        Mag.held = held
+        return held
+    end
+
+    -- killaura: um RegisterAttack + um RegisterHit com TODOS os alvos
+    function Mag.kill(pile)
+        if #pile == 0 then return end
+        local extras = {}
+        for i = 2, #pile do table.insert(extras, pile[i].hrp) end
+        Net.fire(Net.R.Attack, 0.5)
+        Net.fire(Net.R.Hit, pile[1].hrp, extras)
+    end
+
+    function Mag.release()
+        table.clear(Mag.held)
+    end
+end
+
+-- ---- 5.3d FARM MAESTRIA (Cake / Bone / Chocolate / Level + ALL Boss) ----
+-- Regra (consenso da comunidade, nao e oficial): a maestria vai pra arma que
+-- da o GOLPE FINAL e cresce com o level do mob. Por isso os hubs todos tem
+-- "trocar em X% de vida". O loop:
+--   1) derruba o mob com melee/sword (golpe por remote) ate a % configurada
+--   2) troca pra FRUTA (ou gun) e finaliza: skills (com SEGURAR pra quem
+--      precisa, tipo o C do Dragon) + M1 da fruta por REMOTE (LeftClickRemote)
+-- Metodos (nomes reais, update 30):
+--   Cake      = Cake Land: Cookie Crafter/Cake Guard/Baking Staff/Head Baker
+--               (lv 2200-2275; cada kill conta pros 500 do Cake Prince)
+--   Bone      = Haunted Castle: Reborn Skeleton/Living Zombie/Demonic Soul/
+--               Posessed Mummy (lv 1975-2050; dropa Bones)
+--   Chocolate = Chocolate Land: Sweet Thief/Candy Rebel/Cocoa Warrior/
+--               Chocolate Bar Battler (lv 2300-2375; maestria mais rapida)
+--   Level     = o mob escrito na aba Farm (pra quem nao aguenta o Sea 3)
+-- ALL Boss: roda os bosses VIVOS do teu mar (so os que spawnam sozinhos;
+-- boss de quest/raid/invocacao fica de fora).
+do
+    local RunSvc = game:GetService("RunService")
+    local VIM
+    pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+    local METHODS = { "Cake", "Bone", "Chocolate", "Level" }
+    local MOBS = {
+        { ["Cookie Crafter"] = true, ["Cake Guard"] = true, ["Baking Staff"] = true, ["Head Baker"] = true },
+        { ["Reborn Skeleton"] = true, ["Living Zombie"] = true, ["Demonic Soul"] = true, ["Posessed Mummy"] = true },
+        { ["Sweet Thief"] = true, ["Candy Rebel"] = true, ["Cocoa Warrior"] = true, ["Chocolate Bar Battler"] = true },
+    }
+    local BOSSES = {
+        [2753915549] = { "The Gorilla King", "Chef", "The Saw", "Yeti", "Mob Boss", "Vice Admiral",
+                         "Saber Expert", "Warden", "Magma General", "Fishman Lord", "Sky Warlord",
+                         "Lightning God", "Cyborg", "Ice Admiral" },
+        [4442272183] = { "Diamond", "Jeremy", "Orbitus", "Don Swan", "Smoke Admiral",
+                         "Awakened Ice Admiral", "Tide Keeper" },
+        [7449423635] = { "Stone", "Hydra Leader", "Island Empress", "Kilo Admiral", "Captain Elephant",
+                         "Beautiful Pirate", "Longma", "Cake Queen" },
+    }
+    local SKILLMODE = { "off", "toque", "segura 1s", "segura 2s", "segura 3s" }
+    local HOLDS = { 0, 0, 1, 2, 3 }
+    local SKILL_KEYS = { "Z", "X", "C", "V", "F" }
+    Feat.mastMethods = METHODS
+    Feat.mastSkillModes = SKILLMODE
+
+    local st = { status = "parado", lastWarn = {} }
+    local holdPos, holdConn = nil, nil
+
+    local function warnOnce(key, sec, msg)
+        local now = os.clock()
+        if now - (st.lastWarn[key] or -math.huge) >= sec then
+            st.lastWarn[key] = now
+            Core.log(msg)
+        end
+    end
+
+    local function base(name)
+        return (string.gsub(name, "%s*%[.-%]%s*$", ""))
+    end
+
+    local function holdOn()
+        if holdConn then return end
+        holdConn = RunSvc.Heartbeat:Connect(function()
+            if not HUB.alive then
+                if holdConn then holdConn:Disconnect(); holdConn = nil end
+                return
+            end
+            local r = Core.root
+            if r and holdPos then
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.AssemblyAngularVelocity = Vector3.zero
+                r.CFrame = CFrame.new(holdPos)
+            end
+        end)
+    end
+
+    function Feat.mastStop()
+        st.status = "parado"
+        holdPos = nil
+        if holdConn then holdConn:Disconnect(); holdConn = nil end
+        Move.noclip("mast", false)
+        Feat.mastBusy = false
+    end
+
+    function Feat.mastStatus()
+        return st.status
+    end
+
+    local function targetSet()
+        if T.mastboss then
+            local list = BOSSES[game.PlaceId]
+            if list then
+                local set = {}
+                for _, n in ipairs(list) do set[n] = true end
+                return set, "boss"
+            end
+            warnOnce("mar", 60, "mastery: nao conheco os bosses desse mar (PlaceId " .. tostring(game.PlaceId) .. ")")
+        end
+        local m = CFG.MasteryMethod
+        if MOBS[m] then return MOBS[m], METHODS[m] end
+        local set = {}
+        if type(CFG.FarmMob) == "string" and CFG.FarmMob ~= "" then set[CFG.FarmMob] = true end
+        return set, "Level"
+    end
+
+    local function findLive(set)
+        local r = Core.root
+        if not r then return nil end
+        local best
+        for _, fname in ipairs(CFG.EnemyFolders) do
+            local f = workspace:FindFirstChild(fname)
+            if f then
+                for _, e in ipairs(f:GetChildren()) do
+                    if set[base(e.Name)] then
+                        local h  = e:FindFirstChildWhichIsA("Humanoid")
+                        local hr = e:FindFirstChild("HumanoidRootPart")
+                        if h and hr and h.Health > 0 then
+                            local d = (hr.Position - r.Position).Magnitude
+                            if not best or d < best.dist then
+                                best = { model = e, hum = h, hrp = hr, dist = d }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    -- onde os mobs do metodo nascem (pra ir esperar la)
+    local function anchorOf(set)
+        local wo = workspace:FindFirstChild("_WorldOrigin")
+        local sp = wo and wo:FindFirstChild("EnemySpawns")
+        if sp then
+            for _, m in ipairs(sp:GetChildren()) do
+                if set[base(m.Name)] then
+                    local ok, pos = pcall(function()
+                        if m:IsA("BasePart") then return m.Position end
+                        return m:GetPivot().Position
+                    end)
+                    if ok and typeof(pos) == "Vector3" then return pos end
+                end
+            end
+        end
+        for _, e in ipairs(RS:GetChildren()) do
+            if e:IsA("Model") and set[base(e.Name)] then
+                local ok, pos = pcall(function() return e:GetPivot().Position end)
+                if ok and typeof(pos) == "Vector3" and pos.Magnitude > 1 then return pos end
+            end
+        end
+        return nil
+    end
+
+    local function toolOf(tip)
+        local char, bp = Core.char, lp:FindFirstChild("Backpack")
+        local held = char and char:FindFirstChildWhichIsA("Tool")
+        if held and held.ToolTip == tip then return held end
+        if bp then
+            for _, t in ipairs(bp:GetChildren()) do
+                if t:IsA("Tool") and t.ToolTip == tip and not t:FindFirstChild("EatRemote") then
+                    return t
+                end
+            end
+        end
+        return nil
+    end
+
+    local function equipTip(tips)
+        for _, tip in ipairs(tips) do
+            local t = toolOf(tip)
+            if t then
+                if t.Parent ~= Core.char and Core.hum then pcall(function() Core.hum:EquipTool(t) end) end
+                return t
+            end
+        end
+        return nil
+    end
+
+    -- mira: aponta a camera pro alvo (skill e gun atiram pro centro da tela)
+    local function aim(hrp)
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            local r = Core.root
+            if cam and r and hrp.Parent then
+                cam.CFrame = CFrame.lookAt(r.Position + Vector3.new(0, 2, 0), hrp.Position)
+            end
+        end)
+    end
+
+    -- toca ou SEGURA uma tecla de skill (segurar = down, espera, up)
+    local function castKey(letter, holdSec, t)
+        if not VIM then
+            warnOnce("novim", 60, "mastery: sem VirtualInputManager nesse Delta - skills por tecla nao saem")
+            return
+        end
+        local kc = Enum.KeyCode[letter]
+        if not kc then return end
+        pcall(function() VIM:SendKeyEvent(true, kc, false, game) end)
+        local t0 = os.clock()
+        repeat
+            if t and t.hrp and t.hrp.Parent then aim(t.hrp) end
+            task.wait(0.1)
+        until os.clock() - t0 >= math.max(holdSec, 0.06) or not HUB.alive
+        pcall(function() VIM:SendKeyEvent(false, kc, false, game) end)
+    end
+
+    -- M1 (soco) da fruta por REMOTE: a tool da fruta carrega um LeftClickRemote
+    local function m1Remote(tool, t)
+        if not tool then return end
+        local rem = tool:FindFirstChild("LeftClickRemote")
+        if not rem then
+            warnOnce("nom1", 60, "mastery: a tool '" .. tool.Name .. "' nao tem LeftClickRemote - M1 fica de fora")
+            return
+        end
+        pcall(function()
+            local arg = (t and t.hrp and t.hrp.Parent) and t.hrp.Position or nil
+            if rem:IsA("RemoteEvent") then
+                rem:FireServer(arg)
+            elseif rem:IsA("RemoteFunction") then
+                rem:InvokeServer(arg)
+            end
+        end)
+    end
+
+    local function hpFrac(t)
+        if t.hum.MaxHealth <= 0 then return 0 end
+        return t.hum.Health / t.hum.MaxHealth
+    end
+
+    local function keep()
+        return (T.mastery or T.mastboss) and not T.farm and not T.chest
+            and not Feat.boatBusy and not Feat.fruitBusy
+    end
+
+    function Feat.mastStep()
+        if not keep() then
+            Feat.mastStop()
+            if (T.mastery or T.mastboss) and (T.farm or T.chest) then
+                warnOnce("conflito", 20, "mastery esperando: desliga o Auto Farm / Auto Chest")
+            end
+            task.wait(0.5)
+            return
+        end
+        Feat.mastBusy = true
+        local set, label = targetSet()
+        if next(set) == nil then
+            warnOnce("vazio", 30, "mastery: metodo Level sem mob - escreve o nome na aba Farm")
+            task.wait(1)
+            return
+        end
+
+        -- 1) alvo vivo; sem alvo, vai pro spawn esperar
+        local t = findLive(set)
+        if not t then
+            local anc = anchorOf(set)
+            if anc then
+                st.status = label .. ": esperando mob nascer"
+                holdOn(); Move.noclip("mast", true)
+                holdPos = nil
+                if Move.goTo(function() return anc + Vector3.new(0, 20, 0) end,
+                    CFG.FarmHop, CFG.FarmFlySpeed, keep) then
+                    holdPos = anc + Vector3.new(0, 20, 0)
+                end
+            else
+                st.status = label .. ": nada vivo nesse mar agora"
+                warnOnce("semvivo", 45, "mastery (" .. label .. "): nenhum alvo vivo e nao achei o spawn - esperando")
+            end
+            task.wait(1)
+            return
+        end
+
+        -- 2) chegar e segurar em cima
+        holdOn(); Move.noclip("mast", true)
+        if t.dist > Move.hop(CFG.FarmHop) then
+            st.status = "indo ate " .. t.model.Name
+            holdPos = nil
+            if not Move.fly(function()
+                if t.model.Parent and t.hum.Health > 0 then
+                    return t.hrp.Position + Vector3.new(0, CFG.FarmHover, 3)
+                end
+                return nil
+            end, Move.hop(CFG.FarmHop), CFG.FarmFlySpeed, keep) then
+                task.wait(0.1)
+                return
+            end
+        end
+
+        -- 3) fase de dano: melee/sword por remote ate a % de troca
+        local swapAt = math.clamp((CFG.MasterySwapHP or 20) / 100, 0.05, 1)
+        local lastHp, lastDrop = t.hum.Health, os.clock()
+        while keep() and t.model.Parent and t.hum.Health > 0 and hpFrac(t) > swapAt do
+            holdPos = t.hrp.Position + Vector3.new(0, CFG.FarmHover, 3)
+            st.status = ("%s: baixando %s (%d%%)"):format(label, t.model.Name, math.floor(hpFrac(t) * 100))
+            equipTip({ "Melee", "Sword" })
+            local pile = { t }
+            if T.mastmagnet and Feat.Mag then
+                local got = Feat.Mag.update(set, Feat.Mag.areaOf(t.model) or t.hrp.Position)
+                if #got > 0 then pile = got end
+            end
+            Feat.Mag.kill(pile)
+            if t.hum.Health < lastHp - 0.5 then lastHp = t.hum.Health; lastDrop = os.clock() end
+            if os.clock() - lastDrop > 8 then
+                warnOnce("nodmg1", 15, "mastery: golpe por remote sem tirar vida nesse server")
+                break
+            end
+            task.wait(CFG.AttackInterval)
+        end
+
+        -- 4) finalizacao: a FRUTA (ou gun) da o golpe final = leva a maestria
+        local wantGun = (CFG.MasteryWeapon == 2)
+        local tool = equipTip(wantGun and { "Gun" } or { "Blox Fruit" })
+        if not tool then
+            warnOnce("notool", 30, "mastery: nao achei tool de "
+                .. (wantGun and "Gun" or "Blox Fruit") .. " no inventario (ToolTip)")
+            task.wait(1)
+            return
+        end
+        lastHp, lastDrop = t.hum.Health, os.clock()
+        while keep() and t.model.Parent and t.hum.Health > 0 do
+            holdPos = t.hrp.Position + Vector3.new(0, CFG.FarmHover, 3)
+            st.status = ("%s: finalizando %s com %s"):format(label, t.model.Name, tool.Name)
+            aim(t.hrp)
+            if CFG.MastM1 then m1Remote(tool, t) end
+            for _, letter in ipairs(SKILL_KEYS) do
+                if not keep() or not t.model.Parent or t.hum.Health <= 0 then break end
+                local mode = CFG["MastSkill" .. letter]
+                if type(mode) == "number" and mode >= 2 then
+                    castKey(letter, HOLDS[mode] or 0, t)
+                    if CFG.MastM1 then m1Remote(tool, t) end
+                end
+            end
+            if t.hum.Health < lastHp - 0.5 then lastHp = t.hum.Health; lastDrop = os.clock() end
+            if os.clock() - lastDrop > 10 then
+                warnOnce("nodmg2", 15, "mastery: skills/M1 sem tirar vida - skill bloqueada? (precisa da maestria minima)")
+                break
+            end
+            task.wait(CFG.AttackInterval)
+        end
+        if t.hum.Health <= 0 then
+            HUB.stats.mastkills = (HUB.stats.mastkills or 0) + 1
+            st.status = label .. ": +1 kill de maestria (total " .. tostring(HUB.stats.mastkills) .. ")"
+        end
     end
 end
 
@@ -2501,6 +3000,25 @@ task.spawn(function()
     pcall(Feat.farmStop)
 end)
 
+-- mastery: cada passo cuida de um alvo
+task.spawn(function()
+    while HUB.alive do
+        if (T.mastery or T.mastboss) and Core.alive() then
+            local ok, err = pcall(Feat.mastStep)
+            if not ok then
+                pcall(Feat.mastStop)
+                Core.log("erro na mastery: " .. tostring(err))
+                task.wait(1)
+            end
+            task.wait()
+        else
+            if Feat.mastStop then pcall(Feat.mastStop) end
+            task.wait(0.4)
+        end
+    end
+    pcall(Feat.mastStop)
+end)
+
 task.spawn(function()
     while HUB.alive do
         if T.chest and Core.alive() and not Feat.boatBusy and not Feat.fruitBusy then
@@ -2534,9 +3052,10 @@ end)
 -- ============================================================
 local function buildGui()
     local COL = {
-        bg = Color3.fromRGB(18,18,24), panel = Color3.fromRGB(28,28,36),
-        on = Color3.fromRGB(40,120,65), off = Color3.fromRGB(48,48,58),
-        accent = Color3.fromRGB(95,80,160), txt = Color3.fromRGB(236,236,244),
+        bg = Color3.fromRGB(15,15,21), panel = Color3.fromRGB(29,29,40),
+        on = Color3.fromRGB(80,200,120), off = Color3.fromRGB(52,52,64),
+        accent = Color3.fromRGB(125,95,235), txt = Color3.fromRGB(242,242,250),
+        dim = Color3.fromRGB(160,160,178),
     }
     local sg = Instance.new("ScreenGui")
     sg.Name = "BFHUB_PRO"; sg.ResetOnSpawn = false; sg.IgnoreGuiInset = true
@@ -2555,13 +3074,25 @@ local function buildGui()
     win.BackgroundColor3 = COL.bg; win.BackgroundTransparency = 0.05
     Instance.new("UICorner", win).CornerRadius = UDim.new(0, 12)
     HUB._win = win
+    local wstroke = Instance.new("UIStroke", win)
+    wstroke.Color = COL.accent; wstroke.Thickness = 1.5; wstroke.Transparency = 0.45
+    local wgrad = Instance.new("UIGradient", win)
+    wgrad.Rotation = 90
+    wgrad.Color = ColorSequence.new(Color3.fromRGB(23,23,34), COL.bg)
 
     -- header + drag + minimize
     local header = Instance.new("TextLabel", win)
     header.Size = UDim2.new(1,-40,0,32); header.Position = UDim2.fromOffset(0,0)
-    header.BackgroundTransparency = 1; header.Text = "  BF AFK HUB  ::  PRO"
+    header.BackgroundTransparency = 1; header.Text = "   BF HUB  PRO"
     header.TextColor3 = COL.txt; header.Font = Enum.Font.GothamBold
-    header.TextSize = 14; header.TextXAlignment = Enum.TextXAlignment.Left
+    header.TextSize = 15; header.TextXAlignment = Enum.TextXAlignment.Left
+    local hline = Instance.new("Frame", win)
+    hline.Size = UDim2.new(1,-24,0,2); hline.Position = UDim2.fromOffset(12,34)
+    hline.BackgroundColor3 = COL.accent; hline.BorderSizePixel = 0
+    Instance.new("UICorner", hline).CornerRadius = UDim.new(1,0)
+    local hgrad = Instance.new("UIGradient", hline)
+    hgrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) })
 
     local minBtn = Instance.new("TextButton", win)
     minBtn.Size = UDim2.fromOffset(32,32); minBtn.Position = UDim2.new(1,-34,0,0)
@@ -2596,7 +3127,7 @@ local function buildGui()
     end
 
     -- abas: barra que rola pro lado (arrasta pra ver as outras)
-    local TAB_ORDER = { Main = 1, Farm = 2, Boat = 3, Extra = 4, Tune = 5, Custom = 6, Log = 7 }
+    local TAB_ORDER = { Main = 1, Farm = 2, ["Mast."] = 3, Boat = 4, Extra = 5, Tune = 6, Custom = 7, Log = 8 }
     local tabs = Instance.new("ScrollingFrame", body)
     tabs.Size = UDim2.new(1,0,0,30); tabs.BackgroundTransparency = 1
     tabs.BorderSizePixel = 0; tabs.ScrollBarThickness = 0
@@ -2640,11 +3171,26 @@ local function buildGui()
     local function mkToggle(page, label, key)
         local b = Instance.new("TextButton", page)
         b.Size = UDim2.fromOffset(210,32)
-        b.TextColor3 = COL.txt; b.Font = Enum.Font.GothamMedium; b.TextSize = 13
+        b.BackgroundColor3 = COL.panel; b.Text = ""
         Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
+        local dot = Instance.new("Frame", b)
+        dot.Size = UDim2.fromOffset(12,12); dot.Position = UDim2.new(0,10,0.5,-6)
+        dot.BorderSizePixel = 0
+        Instance.new("UICorner", dot).CornerRadius = UDim.new(1,0)
+        local lab = Instance.new("TextLabel", b)
+        lab.Size = UDim2.new(1,-66,1,0); lab.Position = UDim2.fromOffset(30,0)
+        lab.BackgroundTransparency = 1; lab.Text = label
+        lab.TextColor3 = COL.txt; lab.Font = Enum.Font.GothamMedium; lab.TextSize = 13
+        lab.TextXAlignment = Enum.TextXAlignment.Left
+        lab.TextTruncate = Enum.TextTruncate.AtEnd
+        local stt = Instance.new("TextLabel", b)
+        stt.Size = UDim2.fromOffset(32,32); stt.Position = UDim2.new(1,-36,0,0)
+        stt.BackgroundTransparency = 1; stt.Font = Enum.Font.GothamBold; stt.TextSize = 11
         local function paint()
-            b.Text = label..": "..(T[key] and "ON" or "OFF")
-            b.BackgroundColor3 = T[key] and COL.on or COL.off
+            local on = T[key]
+            dot.BackgroundColor3 = on and COL.on or Color3.fromRGB(72,72,86)
+            stt.Text = on and "ON" or "OFF"
+            stt.TextColor3 = on and COL.on or COL.dim
         end
         togglePaint[key] = paint
         paint()
@@ -2678,6 +3224,8 @@ local function buildGui()
         bar.BackgroundColor3 = COL.off; Instance.new("UICorner", bar).CornerRadius = UDim.new(1,0)
         local fill = Instance.new("Frame", bar)
         fill.BackgroundColor3 = COL.accent; Instance.new("UICorner", fill).CornerRadius = UDim.new(1,0)
+        local fgrad = Instance.new("UIGradient", fill)
+        fgrad.Color = ColorSequence.new(COL.accent, Color3.fromRGB(95,165,240))
         local function render()
             local v = CFG[cfgKey]
             cap.Text = label..": "..((step < 1) and string.format("%.2f", v) or tostring(v))
@@ -2821,6 +3369,9 @@ local function buildGui()
         end)
         mkAction(farmTab, "Testar ataque de novo", function() Feat.farmReprobe() end)
         mkBox("teclas de skill (ex: ZXC)", "FarmKeys", true)
+        mkToggle(farmTab, "Puxar mobs (killaura)", "magnet")
+        mkSlider(farmTab, "Alcance do magnet", "MagnetRange", 100, 400, 10)
+        mkSlider(farmTab, "Mobs na pilha", "MagnetStack", 2, 12, 1)
         mkSlider(farmTab, "Altura em cima do mob", "FarmHover", 0, 60, 1)
         mkSlider(farmTab, "Pulo instantaneo ate", "FarmHop", 40, 400, 10)
         mkSlider(farmTab, "Voo (velocidade)", "FarmFlySpeed", 100, 350, 10)
@@ -2861,6 +3412,55 @@ local function buildGui()
     mkSlider(tune, "Voo do bau (vel.)", "ChestFlySpeed", 100, 350, 10)
     mkSlider(tune, "Espera bau longe", "ChestFarWait", 1, 4, 0.1)
     mkSlider(tune, "Call Cooldown", "CallCooldown", 0.05, 0.5, 0.01)
+
+    -- aba MAST. (farm de maestria)
+    local mastTab = addTab("Mast.")
+    do
+        local status = Instance.new("TextLabel", mastTab)
+        status.Size = UDim2.fromOffset(210, 34); status.BackgroundColor3 = COL.panel
+        status.TextColor3 = COL.txt; status.Font = Enum.Font.Gotham; status.TextSize = 12
+        status.TextWrapped = true
+        status.Text = "mastery: parado"
+        Instance.new("UICorner", status).CornerRadius = UDim.new(0,8)
+        task.spawn(function()
+            while HUB.alive and status.Parent do
+                if mastTab.Visible and Feat.mastStatus then
+                    status.Text = "mastery: " .. tostring(Feat.mastStatus())
+                end
+                task.wait(0.5)
+            end
+        end)
+
+        mkToggle(mastTab, "Auto Mastery", "mastery")
+        mkToggle(mastTab, "Mastery ALL Boss", "mastboss")
+        mkToggle(mastTab, "Puxar mobs (magnet)", "mastmagnet")
+
+        local function metName() return "Metodo: " .. (Feat.mastMethods[CFG.MasteryMethod] or "Cake") end
+        mkAction(mastTab, metName(), function(b)
+            CFG.MasteryMethod = (CFG.MasteryMethod % #Feat.mastMethods) + 1
+            b.Text = metName(); Core.save()
+        end)
+        local function wepName() return "Treinar: " .. (CFG.MasteryWeapon == 2 and "Gun" or "Fruta") end
+        mkAction(mastTab, wepName(), function(b)
+            CFG.MasteryWeapon = (CFG.MasteryWeapon == 2) and 1 or 2
+            b.Text = wepName(); Core.save()
+        end)
+        local function m1Name() return "M1 da fruta (remote): " .. (CFG.MastM1 and "ON" or "OFF") end
+        mkAction(mastTab, m1Name(), function(b)
+            CFG.MastM1 = not CFG.MastM1; b.Text = m1Name(); Core.save()
+        end)
+        mkSlider(mastTab, "Trocar com % de vida", "MasterySwapHP", 5, 100, 5)
+        for _, letter in ipairs({ "Z", "X", "C", "V", "F" }) do
+            local key = "MastSkill" .. letter
+            local function skName()
+                return "Skill " .. letter .. ": " .. (Feat.mastSkillModes[CFG[key]] or "off")
+            end
+            mkAction(mastTab, skName(), function(b)
+                CFG[key] = ((CFG[key] or 1) % #Feat.mastSkillModes) + 1
+                b.Text = skName(); Core.save()
+            end)
+        end
+    end
 
     -- aba BOAT (levantar + velocidade + auto leviathan)
     local boatTab = addTab("Boat")
@@ -3093,6 +3693,19 @@ if type(CFG.FarmAttack) ~= "number" or CFG.FarmAttack < 0 or CFG.FarmAttack > 5 
 if type(CFG.FarmWeapon) ~= "number" or CFG.FarmWeapon < 1 or CFG.FarmWeapon > 5 then CFG.FarmWeapon = 1 end
 if type(CFG.FarmMob) ~= "string" then CFG.FarmMob = "" end
 if type(CFG.FarmKeys) ~= "string" or CFG.FarmKeys == "" then CFG.FarmKeys = "ZXC" end
+if type(CFG.MagnetRange) ~= "number" or CFG.MagnetRange < 50 then CFG.MagnetRange = 250 end
+if type(CFG.MagnetStack) ~= "number" or CFG.MagnetStack < 1 then CFG.MagnetStack = 6 end
+if type(CFG.MasteryMethod) ~= "number" or CFG.MasteryMethod < 1 or CFG.MasteryMethod > 4 then CFG.MasteryMethod = 1 end
+if CFG.MasteryWeapon ~= 2 then CFG.MasteryWeapon = 1 end
+if type(CFG.MasterySwapHP) ~= "number" then CFG.MasterySwapHP = 20 end
+if type(CFG.MastM1) ~= "boolean" then CFG.MastM1 = true end
+do
+    local defaults = { Z = 4, X = 1, C = 5, V = 2, F = 1 }
+    for letter, dv in pairs(defaults) do
+        local k = "MastSkill" .. letter
+        if type(CFG[k]) ~= "number" or CFG[k] < 1 or CFG[k] > 5 then CFG[k] = dv end
+    end
+end
 do  -- config salva antiga ganha os nomes novos (LeviathanGate fica em workspace.Map)
     local function ensure(list, value)
         if type(list) ~= "table" then return end
