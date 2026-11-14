@@ -61,6 +61,21 @@ local DEFAULTS = {
     ChestStreamWait  = 2.0,     -- teto esperando a area RENDERIZAR apos o TP (streaming)
     ChestSettle      = 0.12,    -- respiro extra depois que carregou, antes de tocar
 
+    -- barco (levantar / velocidade / auto leviathan)
+    BoatFolder      = "Boats",   -- pasta dos barcos no workspace (fallback: o modelo do assento)
+    BoatMethod      = 1,         -- voo: 1 = cframe | 2 = velocity | 3 = body (troca na aba Boat)
+    BoatLift        = 150,       -- altura do "Levantar Barco" (studs acima de onde ligou)
+    BoatRiseSpeed   = 60,        -- studs/s subindo e descendo (suave, sem TP)
+    BoatSpeed       = 200,       -- velocidade do "Boat Speed"
+    SpeedMethod     = 1,         -- 1 = maxspeed (muda o MaxSpeed do assento) | 2 = empurrao (velocidade direta)
+    LeviHeight      = 400,       -- altura de cruzeiro do Auto Leviathan
+    LeviSpeed       = 180,       -- studs/s de cruzeiro (alto demais = server puxa de volta)
+    LeviOutDist     = 5000,      -- quanto anda reto na direcao do barco antes de patrulhar
+    LeviLeg         = 2500,      -- tamanho de cada perna da patrulha (quadrado)
+    -- o que conta como "a dimensao apareceu" (nomes mudam por update: confere no Explorer)
+    LeviSigns       = { "Frozen Dimension", "Leviathan" },
+    LeviContainers  = { "_WorldOrigin/Locations", "Map", "SeaBeasts" },
+
     -- geral
     RejoinOnDrop    = true,
     CallCooldown    = 0.12,     -- pacing global dos remotes
@@ -104,7 +119,8 @@ end
 getgenv().BFHUB = {}
 local HUB = getgenv().BFHUB
 HUB.alive = true
-HUB.toggles = { farm = false, quest = false, chest = false, stat = false, idle = true }
+HUB.toggles = { farm = false, quest = false, chest = false, stat = false, idle = true,
+                lift = false, levi = false, speed = false }
 HUB.config  = table.clone(DEFAULTS)
 HUB.custom  = {}   -- { {name=, verb=, args={}} }
 
@@ -127,7 +143,7 @@ do
     function Core.log(msg)
         msg = tostring(msg)
         table.insert(Core.logLines, "[" .. os.date("%H:%M:%S") .. "] " .. msg)
-        if #Core.logLines > 80 then table.remove(Core.logLines, 1) end
+        if #Core.logLines > 150 then table.remove(Core.logLines, 1) end
         print("[BFHUB] " .. msg)
         if Core.logHook then pcall(Core.logHook) end
     end
@@ -391,7 +407,7 @@ do
     end
 
     function Feat.farmStep()
-        if Feat.chestBusy then return end
+        if Feat.chestBusy or Feat.boatBusy then return end
         local es = enemies()
         local tgt = es[1]
         if not tgt or tgt.dist > CFG.AttackRange then return end
@@ -399,8 +415,10 @@ do
         local r = Core.root
         if not r then return end
         r.CFrame = tgt.hrp.CFrame * CFrame.new(0, 0, CFG.ApproachOffset)
-        Net.fire(Net.R.Attack, 1)
-        Net.fire(Net.R.Hit, tgt.model, 1)
+        -- shape observado: Attack(numero pequeno) / Hit(parte do alvo, {alvos extras}).
+        -- e a parte mais volatil do jogo: se nao bater, confirma no logger.
+        Net.fire(Net.R.Attack, 0.4)
+        Net.fire(Net.R.Hit, tgt.hrp, {})
     end
 end
 
@@ -550,7 +568,7 @@ do
     end)
     task.spawn(function()
         while HUB.alive do
-            task.wait(15)
+            task.wait(45)
             if T.chest then fullScan() end
         end
     end)
@@ -778,7 +796,397 @@ do
         Feat.chestBusy = false
     end
 
+    -- numeros pro diagnostico: achados, vivos, com TouchInterest, por tag, moeda
+    function Feat.chestInfo()
+        fullScan()
+        local total, alive, withTI = 0, 0, 0
+        for part in pairs(live) do
+            total += 1
+            if part:FindFirstChildWhichIsA("TouchTransmitter") then withTI += 1 end
+            if isLive(part) then alive += 1 end
+        end
+        local tagged = 0
+        pcall(function() tagged = #CS:GetTagged(CFG.ChestTag) end)
+        beli()
+        return total, alive, withTI, tagged, (beliObj and beliObj:GetFullName() or nil)
+    end
+
     fullScan()
+end
+
+-- ---- 5.8 barco: levantar + velocidade + auto leviathan ----
+-- Nao existe remote de "voar barco": o que move o barco e fisica no cliente
+-- (quem ta sentado no assento tem o controle de rede do barco, entao o que
+-- o cliente faz nele replica). Tres metodos de voo pra testar qual segura:
+--   1 cframe   : posiciona o barco todo frame (mais firme, mais "teleporte")
+--   2 velocity : so controla a velocidade (mais suave, cede um pouco)
+--   3 body     : BodyVelocity dentro do barco (o motor de fisica segura)
+-- Subida e descida sao SUAVES (BoatRiseSpeed) - nada de TP vertical.
+do
+    local RunSvc  = game:GetService("RunService")
+    local METHODS = { "cframe", "velocity", "body" }
+    local SPEEDS  = { "maxspeed", "empurrao" }
+    Feat.boatMethods  = METHODS
+    Feat.speedMethods = SPEEDS
+
+    local boat, boatRoot
+    local flyConn, bv
+    local active, landing, baseY = false, false, nil
+    local lastWarn, errUntil = 0, 0
+    local leviOn = false
+    local levi = { state = "off" }
+
+    -- acha o barco pelo assento em que o personagem ta sentado (nao depende
+    -- do nome do barco). guarda a referencia pra continuar valendo depois.
+    local function findBoat()
+        local hum = Core.hum
+        local seat = hum and hum.SeatPart
+        if seat and seat.Parent then
+            local m = seat:FindFirstAncestorWhichIsA("Model")
+            local folder = workspace:FindFirstChild(CFG.BoatFolder)
+            if folder and seat:IsDescendantOf(folder) then
+                local cur = seat
+                while cur.Parent and cur.Parent ~= folder do cur = cur.Parent end
+                if cur:IsA("Model") then m = cur end
+            end
+            if m then
+                boat = m
+                boatRoot = seat.AssemblyRootPart or m.PrimaryPart or seat
+            end
+        end
+        if boat and boat.Parent and boatRoot and boatRoot.Parent then return boat, boatRoot end
+        boat, boatRoot = nil, nil
+    end
+
+    local function release()
+        if flyConn then flyConn:Disconnect(); flyConn = nil end
+        if bv then pcall(function() bv:Destroy() end); bv = nil end
+        active, landing = false, false
+        Feat.boatBusy = false
+    end
+
+    local function step(dt)
+        local _, root = findBoat()
+        if not root then
+            release()
+            Core.log("barco: perdi o barco (destruido ou longe demais)")
+            return
+        end
+        local pos = root.Position
+
+        -- altura alvo: pousando volta pra onde ligou
+        local goalY = baseY
+        if not landing then
+            goalY = baseY + (T.levi and CFG.LeviHeight or CFG.BoatLift)
+        end
+        local dy = goalY - pos.Y
+        if landing and math.abs(dy) < 3 then
+            release()
+            Core.log("barco: de volta na agua")
+            return
+        end
+
+        -- velocidade horizontal: so o auto levi dirige. no "levantar" voce pilota.
+        local driving = T.levi and not landing
+        local hv = Vector3.zero
+        if driving and levi.state == "cruise" and levi.dir then
+            hv = levi.dir * CFG.LeviSpeed
+            local flat = Vector3.new(pos.X - levi.legStart.X, 0, pos.Z - levi.legStart.Z).Magnitude
+            local limit = (levi.phase == "out") and CFG.LeviOutDist or CFG.LeviLeg
+            if flat >= limit then
+                -- vira 90 graus pra direita: depois da ida, patrulha em quadrado
+                levi.phase = "patrol"
+                levi.legStart = pos
+                levi.dir = Vector3.new(-levi.dir.Z, 0, levi.dir.X)
+            end
+        end
+
+        local rise = CFG.BoatRiseSpeed
+        local vy = math.clamp(dy * 3, -rise, rise)
+        local cur = root.AssemblyLinearVelocity
+        local method = CFG.BoatMethod
+
+        if method ~= 3 and bv then pcall(function() bv:Destroy() end); bv = nil end
+
+        if method == 1 then
+            local newY = pos.Y + math.clamp(dy, -rise * dt, rise * dt)
+            local p
+            if driving then
+                p = Vector3.new(pos.X + hv.X * dt, newY, pos.Z + hv.Z * dt)
+                root.AssemblyLinearVelocity = hv
+            else
+                p = Vector3.new(pos.X, newY, pos.Z)
+                root.AssemblyLinearVelocity = Vector3.new(cur.X, 0, cur.Z)
+            end
+            -- mantem a rotacao que o barco ja tem (so troca a posicao)
+            root.CFrame = CFrame.new(p) * root.CFrame.Rotation
+        elseif method == 2 then
+            if driving then
+                root.AssemblyLinearVelocity = Vector3.new(hv.X, vy, hv.Z)
+            else
+                root.AssemblyLinearVelocity = Vector3.new(cur.X, vy, cur.Z)
+            end
+        else
+            if not bv or bv.Parent ~= root then
+                if bv then pcall(function() bv:Destroy() end) end
+                bv = Instance.new("BodyVelocity")
+                bv.Name = "HubLift"
+                bv.P = 9000
+                bv.Parent = root
+            end
+            bv.MaxForce = driving and Vector3.new(math.huge, math.huge, math.huge)
+                                   or Vector3.new(0, math.huge, 0)
+            bv.Velocity = Vector3.new(hv.X, vy, hv.Z)
+        end
+        if driving then root.AssemblyAngularVelocity = Vector3.zero end
+    end
+
+    local function start()
+        if os.clock() < errUntil then return end
+        local _, root = findBoat()
+        if not root then
+            if os.clock() - lastWarn > 5 then
+                lastWarn = os.clock()
+                Core.log("barco: senta no assento do barco primeiro")
+            end
+            return
+        end
+        baseY = root.Position.Y
+        active, landing = true, false
+        Feat.boatBusy = true
+        flyConn = RunSvc.Heartbeat:Connect(function(dt)
+            if not HUB.alive then release(); return end
+            local ok, err = pcall(step, dt)
+            if not ok then
+                release()
+                errUntil = os.clock() + 5
+                Core.log("barco erro: " .. tostring(err))
+            end
+        end)
+        Core.log("barco subindo (metodo " .. (METHODS[CFG.BoatMethod] or "?") .. ")")
+    end
+
+    -- ---------- velocidade do barco ----------
+    -- maxspeed : muda o MaxSpeed do assento (o proprio jogo acelera ate ele).
+    --            e o jeito "limpo"; so funciona se o barco usar VehicleSeat.
+    -- empurrao : quando voce acelera, joga a velocidade direto no barco.
+    --            funciona em qualquer barco, mas e mais facil o server notar.
+    local spSeat, spOrig, speedConn
+    local function speedRestore()
+        if spSeat and spSeat.Parent and spOrig then
+            pcall(function() spSeat.MaxSpeed = spOrig end)
+        end
+        spSeat, spOrig = nil, nil
+    end
+    local function speedPushOff()
+        if speedConn then speedConn:Disconnect(); speedConn = nil end
+    end
+    local function speedPush()
+        if not HUB.alive then speedPushOff(); return end
+        if T.levi then return end                 -- no auto levi quem dirige e o hub
+        local hum = Core.hum
+        local seat = hum and hum.SeatPart
+        if not (seat and seat.Parent) then return end
+        local dir
+        if seat:IsA("VehicleSeat") then
+            local th = seat.ThrottleFloat
+            if th == 0 then th = seat.Throttle end
+            if math.abs(th) < 0.05 then return end
+            local look = seat.CFrame.LookVector
+            dir = Vector3.new(look.X, 0, look.Z) * th
+        else
+            local mv = hum.MoveDirection            -- assento comum: usa o analogico
+            dir = Vector3.new(mv.X, 0, mv.Z)
+        end
+        if dir.Magnitude < 0.1 then return end
+        dir = dir.Unit * CFG.BoatSpeed
+        local root = seat.AssemblyRootPart or seat
+        local cur = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(dir.X, cur.Y, dir.Z)
+    end
+    local function speedTick()
+        local seat = Core.hum and Core.hum.SeatPart
+        local wantMax  = T.speed and CFG.SpeedMethod == 1
+        local wantPush = T.speed and CFG.SpeedMethod == 2
+        if wantMax and seat and seat.Parent and seat:IsA("VehicleSeat") then
+            if spSeat ~= seat then
+                speedRestore()
+                spSeat, spOrig = seat, seat.MaxSpeed
+                Core.log("boat speed: MaxSpeed " .. tostring(spOrig) .. " -> " .. tostring(CFG.BoatSpeed))
+            end
+            if seat.MaxSpeed ~= CFG.BoatSpeed then seat.MaxSpeed = CFG.BoatSpeed end
+        elseif spSeat then
+            speedRestore()
+        end
+        if wantPush and not speedConn then
+            speedConn = RunSvc.Heartbeat:Connect(function() pcall(speedPush) end)
+        elseif not wantPush and speedConn then
+            speedPushOff()
+        end
+    end
+
+    -- procura o sinal de que o Leviathan/dimensao apareceu (busca barata:
+    -- so filhos diretos de poucas pastas, 1x a cada 1.5s)
+    local function leviSign()
+        for _, path in ipairs(CFG.LeviContainers) do
+            local node = workspace
+            for seg in string.gmatch(path, "[^/]+") do
+                node = node and node:FindFirstChild(seg)
+            end
+            if node then
+                for _, name in ipairs(CFG.LeviSigns) do
+                    local hit = node:FindFirstChild(name)
+                    if hit then return hit end
+                end
+            end
+        end
+    end
+
+    local function notify(title, text)
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification",
+                { Title = title, Text = text, Duration = 10 })
+        end)
+    end
+
+    function Feat.boatStatus()
+        if not active then return "na agua" end
+        if landing then return "descendo" end
+        if T.levi then return "auto levi: " .. tostring(levi.state) .. " / " .. tostring(levi.phase or "-") end
+        return "levantado"
+    end
+
+    -- gerente: liga/desliga o voo conforme os toggles e cuida do estado do levi
+    task.spawn(function()
+        local lastCheck = 0
+        while HUB.alive do
+            local want = T.lift or T.levi
+            if want and not active then
+                start()
+            elseif want and landing then
+                landing = false            -- religou no meio da descida
+            elseif not want and active and not landing then
+                landing = true
+                Core.log("barco: descendo devagar")
+            end
+
+            if T.levi and active and not leviOn and boatRoot then
+                leviOn = true
+                local seat = Core.hum and Core.hum.SeatPart
+                local look = ((seat and seat.Parent) and seat or boatRoot).CFrame.LookVector
+                local d = Vector3.new(look.X, 0, look.Z)
+                d = (d.Magnitude > 0.1) and d.Unit or Vector3.new(0, 0, -1)
+                levi = { state = "cruise", phase = "out", dir = d, legStart = boatRoot.Position }
+                Core.log("auto levi: cruzando na direcao do barco")
+            elseif not T.levi and leviOn then
+                leviOn = false
+                levi = { state = "off" }
+            end
+
+            if leviOn and levi.state == "cruise" and os.clock() - lastCheck > 1.5 then
+                lastCheck = os.clock()
+                local ok, hit = pcall(leviSign)
+                if ok and hit then
+                    levi.state = "found"   -- para de andar, continua flutuando
+                    Core.log("auto levi: ACHOU -> " .. hit:GetFullName())
+                    notify("BF HUB", "Leviathan / dimensao apareceu: " .. hit.Name)
+                end
+            end
+
+            pcall(speedTick)
+            task.wait(0.2)
+        end
+        release()
+        speedRestore()
+        speedPushOff()
+    end)
+
+    -- remote REAL do espiao (verbo visto em scripts antigos, NAO confirmado
+    -- nessa versao): so consulta e mostra a resposta no Log.
+    function Feat.leviSpy()
+        local ok, res = Net.commf("InfoLeviathan", "1")
+        Core.log("spy InfoLeviathan -> " .. tostring(ok) .. " / " .. tostring(res))
+    end
+end
+
+-- ---- 5.9 diagnostico: joga no Log tudo que o hub precisa saber do jogo ----
+-- Um toque e eu paro de chutar nome de pasta/remote: manda o resultado no chat.
+function Feat.diagnose()
+    local L = Core.log
+    local function yn(v) return v and "sim" or "NAO" end
+    local function fn(name, f) return name .. ":" .. yn(type(f) == "function") end
+
+    L("==== DIAGNOSTICO ====")
+    local exec = "?"
+    pcall(function() if identifyexecutor then exec = tostring((identifyexecutor())) end end)
+    L("exec " .. exec .. " | place " .. tostring(game.PlaceId) .. " v" .. tostring(game.PlaceVersion))
+    L(table.concat({
+        fn("touch", firetouchinterest), fn("hook", hookmetamethod),
+        fn("file", writefile), fn("hui", gethui), fn("clip", setclipboard or toclipboard),
+    }, " "))
+
+    Net.resolve()
+    L("remotes CommF:" .. yn(Net.R.CommF) .. " Attack:" .. yn(Net.R.Attack)
+        .. " Hit:" .. yn(Net.R.Hit) .. " Browser:" .. yn(Net.R.Browser))
+
+    if Feat.chestInfo then
+        local ok, total, alive, withTI, tagged, coin = pcall(Feat.chestInfo)
+        if ok then
+            L(("baus: %d achados, %d vivos, %d c/ touch, %d por tag"):format(total, alive, withTI, tagged))
+            L("moeda: " .. (coin or "NAO ACHADA"))
+        else
+            L("baus: erro -> " .. tostring(total))
+        end
+    end
+    L("streaming: " .. tostring(workspace.StreamingEnabled))
+
+    for _, name in ipairs(CFG.EnemyFolders) do
+        local f = workspace:FindFirstChild(name)
+        L("pasta mobs '" .. name .. "': " .. (f and (#f:GetChildren() .. " filhos") or "NAO EXISTE"))
+    end
+    local cands = {}
+    for _, c in ipairs(workspace:GetChildren()) do
+        if #cands >= 6 then break end
+        if c:IsA("Folder") or c:IsA("Model") then
+            local n = 0
+            for i, m in ipairs(c:GetChildren()) do
+                if i > 40 then break end
+                if m:IsA("Model") and m:FindFirstChildWhichIsA("Humanoid") then n += 1 end
+            end
+            if n > 0 then table.insert(cands, c.Name .. "(" .. n .. ")") end
+        end
+    end
+    L("pastas com mobs/npcs: " .. (#cands > 0 and table.concat(cands, ", ") or "nenhuma"))
+
+    local pg = lp:FindFirstChild("PlayerGui")
+    local mainGui = pg and pg:FindFirstChild("Main")
+    local q = mainGui and mainGui:FindFirstChild("Quest")
+    L("tracker Main.Quest: " .. yn(q))
+
+    local bf = workspace:FindFirstChild(CFG.BoatFolder)
+    L("pasta barcos '" .. CFG.BoatFolder .. "': " .. (bf and (#bf:GetChildren() .. " barcos") or "NAO EXISTE"))
+    local seat = Core.hum and Core.hum.SeatPart
+    if seat then
+        local line = "assento: " .. seat.ClassName .. " em " .. seat:GetFullName()
+        if seat:IsA("VehicleSeat") then line = line .. " | MaxSpeed " .. tostring(seat.MaxSpeed) end
+        L(line)
+    else
+        L("assento: voce nao ta sentado (senta no barco e roda de novo)")
+    end
+
+    for _, path in ipairs(CFG.LeviContainers) do
+        local node = workspace
+        for seg in string.gmatch(path, "[^/]+") do node = node and node:FindFirstChild(seg) end
+        local found = {}
+        if node then
+            for _, name in ipairs(CFG.LeviSigns) do
+                if node:FindFirstChild(name) then table.insert(found, name) end
+            end
+        end
+        L("levi '" .. path .. "': " .. (node and "existe" or "NAO EXISTE")
+            .. (#found > 0 and (" | achou: " .. table.concat(found, ", ")) or ""))
+    end
+    L("==== FIM (usa Copiar Log ou manda print) ====")
 end
 
 -- ---- 5.7 verbo customizado (CDK/Soul/Halloween apos logar) ----
@@ -806,7 +1214,7 @@ end)
 
 task.spawn(function()
     while HUB.alive do
-        if T.chest and Core.alive() then
+        if T.chest and Core.alive() and not Feat.boatBusy then
             local ok, err = pcall(Feat.chestStep)
             if not ok then
                 pcall(Feat.chestStop)   -- solta busy E noclip
@@ -814,6 +1222,10 @@ task.spawn(function()
                 task.wait(1)
             end
         else
+            if T.chest and Feat.boatBusy and os.clock() - (Feat._boatWarn or 0) > 15 then
+                Feat._boatWarn = os.clock()
+                Core.log("auto chest pausado: barco no ar (desliga Levantar/Auto Levi)")
+            end
             if Feat.chestStop then Feat.chestStop() end
             task.wait(0.5)
         end
@@ -849,7 +1261,7 @@ local function buildGui()
     HUB._gui = sg
 
     local win = Instance.new("Frame", sg)
-    win.Size = UDim2.fromOffset(250, 300)
+    win.Size = UDim2.fromOffset(280, 300)
     win.Position = UDim2.fromScale(0.03, 0.18)
     win.BackgroundColor3 = COL.bg; win.BackgroundTransparency = 0.05
     Instance.new("UICorner", win).CornerRadius = UDim.new(0, 12)
@@ -872,7 +1284,7 @@ local function buildGui()
 
     minBtn.MouseButton1Click:Connect(function()
         body.Visible = not body.Visible
-        win.Size = body.Visible and UDim2.fromOffset(250,300) or UDim2.fromOffset(250,40)
+        win.Size = body.Visible and UDim2.fromOffset(280,300) or UDim2.fromOffset(280,40)
     end)
 
     do -- drag
@@ -904,11 +1316,12 @@ local function buildGui()
     pages.BackgroundTransparency = 1
 
     local pageMap = {}
+    local tabBtns = {}
     local function addTab(name)
         local btn = Instance.new("TextButton", tabs)
-        btn.Size = UDim2.fromOffset(72,28); btn.Text = name
+        btn.Size = UDim2.fromOffset(49,28); btn.Text = name
         btn.BackgroundColor3 = COL.panel; btn.TextColor3 = COL.txt
-        btn.Font = Enum.Font.GothamMedium; btn.TextSize = 12
+        btn.Font = Enum.Font.GothamMedium; btn.TextSize = 11
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0,6)
         local page = Instance.new("ScrollingFrame", pages)
         page.Size = UDim2.fromScale(1,1); page.Visible = false
@@ -917,24 +1330,31 @@ local function buildGui()
         local lay = Instance.new("UIListLayout", page)
         lay.Padding = UDim.new(0,6); lay.HorizontalAlignment = Enum.HorizontalAlignment.Center
         pageMap[name] = page
+        tabBtns[name] = btn
         btn.MouseButton1Click:Connect(function()
             for _, p in pairs(pageMap) do p.Visible = false end
+            for _, tb in pairs(tabBtns) do tb.BackgroundColor3 = COL.panel end
             page.Visible = true
+            btn.BackgroundColor3 = COL.accent
         end)
         return page
     end
 
+    local togglePaint = {}
     local function mkToggle(page, label, key)
         local b = Instance.new("TextButton", page)
         b.Size = UDim2.fromOffset(210,32)
-        b.BackgroundColor3 = T[key] and COL.on or COL.off
-        b.Text = label..": "..(T[key] and "ON" or "OFF")
         b.TextColor3 = COL.txt; b.Font = Enum.Font.GothamMedium; b.TextSize = 13
         Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
-        b.MouseButton1Click:Connect(function()
-            T[key] = not T[key]
+        local function paint()
             b.Text = label..": "..(T[key] and "ON" or "OFF")
             b.BackgroundColor3 = T[key] and COL.on or COL.off
+        end
+        togglePaint[key] = paint
+        paint()
+        b.MouseButton1Click:Connect(function()
+            T[key] = not T[key]
+            paint()
             Core.save()
         end)
     end
@@ -985,6 +1405,26 @@ local function buildGui()
 
     -- aba MAIN
     local main = addTab("Main")
+    do
+        local st = Instance.new("TextLabel", main)
+        st.Size = UDim2.fromOffset(210,22); st.BackgroundColor3 = COL.panel
+        st.TextColor3 = COL.txt; st.Font = Enum.Font.Gotham; st.TextSize = 12
+        st.LayoutOrder = -1
+        Instance.new("UICorner", st).CornerRadius = UDim.new(0,8)
+        local function paint()
+            local d = HUB.stats or {}
+            st.Text = ("baus %d | beli %d | falhas %d"):format(
+                math.floor(d.chests or 0), math.floor(d.beli or 0), math.floor(d.fails or 0))
+        end
+        paint()
+        -- 1x por segundo e so com a aba aberta
+        task.spawn(function()
+            while HUB.alive and st.Parent do
+                if main.Visible then pcall(paint) end
+                task.wait(1)
+            end
+        end)
+    end
     mkToggle(main, "Auto Farm", "farm")
     mkToggle(main, "Auto Quest", "quest")
     mkToggle(main, "Auto Chest", "chest")
@@ -997,6 +1437,20 @@ local function buildGui()
         hop.Font = Enum.Font.GothamMedium; hop.TextSize = 13
         Instance.new("UICorner", hop).CornerRadius = UDim.new(0,8)
         hop.MouseButton1Click:Connect(function() task.spawn(Feat.hopServer) end)
+
+        local stop = Instance.new("TextButton", main)
+        stop.Size = UDim2.fromOffset(210,30); stop.BackgroundColor3 = Color3.fromRGB(150,50,50)
+        stop.Text = "PARAR TUDO"; stop.TextColor3 = COL.txt
+        stop.Font = Enum.Font.GothamBold; stop.TextSize = 13
+        Instance.new("UICorner", stop).CornerRadius = UDim.new(0,8)
+        stop.MouseButton1Click:Connect(function()
+            for k in pairs(T) do
+                if k ~= "idle" then T[k] = false end
+            end
+            for _, paint in pairs(togglePaint) do pcall(paint) end
+            Core.save()
+            Core.log("tudo desligado (o barco desce devagar)")
+        end)
     end
 
     -- aba TUNE (sliders)
@@ -1009,6 +1463,65 @@ local function buildGui()
     mkSlider(tune, "Call Cooldown", "CallCooldown", 0.05, 0.5, 0.01)
 
     -- aba CUSTOM (verbos logados)
+    -- aba BOAT (levantar + velocidade + auto leviathan)
+    local boatTab = addTab("Boat")
+    do
+        local status = Instance.new("TextLabel", boatTab)
+        status.Size = UDim2.fromOffset(210, 22); status.BackgroundColor3 = COL.panel
+        status.TextColor3 = COL.txt; status.Font = Enum.Font.Gotham; status.TextSize = 12
+        status.Text = "barco: na agua"
+        Instance.new("UICorner", status).CornerRadius = UDim.new(0,8)
+        -- atualiza 2x por segundo e so com a aba aberta (nao pesa)
+        task.spawn(function()
+            while HUB.alive and status.Parent do
+                if boatTab.Visible and Feat.boatStatus then
+                    status.Text = "barco: " .. Feat.boatStatus()
+                end
+                task.wait(0.5)
+            end
+        end)
+
+        local function actionBtn(text, cb)
+            local b = Instance.new("TextButton", boatTab)
+            b.Size = UDim2.fromOffset(210,30); b.BackgroundColor3 = COL.accent
+            b.Text = text; b.TextColor3 = COL.txt
+            b.Font = Enum.Font.GothamMedium; b.TextSize = 13
+            Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
+            b.MouseButton1Click:Connect(function() cb(b) end)
+            return b
+        end
+
+        -- velocidade
+        mkToggle(boatTab, "Boat Speed", "speed")
+        mkSlider(boatTab, "Velocidade do barco", "BoatSpeed", 50, 500, 10)
+        local function speedName()
+            return "Speed: " .. (Feat.speedMethods[CFG.SpeedMethod] or "maxspeed")
+        end
+        actionBtn(speedName(), function(b)
+            CFG.SpeedMethod = (CFG.SpeedMethod % #Feat.speedMethods) + 1
+            b.Text = speedName(); Core.save()
+        end)
+
+        -- voo
+        mkToggle(boatTab, "Levantar Barco", "lift")
+        mkToggle(boatTab, "Auto Leviathan", "levi")
+        local function methodName()
+            return "Voo: " .. (Feat.boatMethods[CFG.BoatMethod] or "cframe")
+        end
+        actionBtn(methodName(), function(b)
+            CFG.BoatMethod = (CFG.BoatMethod % #Feat.boatMethods) + 1
+            b.Text = methodName(); Core.save()
+        end)
+        actionBtn("Checar Spy (remote)", function() task.spawn(Feat.leviSpy) end)
+
+        mkSlider(boatTab, "Altura (levantar)", "BoatLift", 20, 600, 10)
+        mkSlider(boatTab, "Altura (auto levi)", "LeviHeight", 100, 1500, 50)
+        mkSlider(boatTab, "Velocidade levi", "LeviSpeed", 40, 350, 10)
+        mkSlider(boatTab, "Subida/descida", "BoatRiseSpeed", 20, 150, 5)
+        mkSlider(boatTab, "Ida reta", "LeviOutDist", 0, 20000, 500)
+        mkSlider(boatTab, "Perna da patrulha", "LeviLeg", 500, 6000, 250)
+    end
+
     local custom = addTab("Custom")
     do
         local box = Instance.new("TextBox", custom)
@@ -1056,6 +1569,35 @@ local function buildGui()
 
     -- aba LOG (console)
     local logpage = addTab("Log")
+    do
+        local row = Instance.new("Frame", logpage)
+        row.Size = UDim2.fromOffset(210,28); row.BackgroundTransparency = 1
+        row.LayoutOrder = -1
+        local rl = Instance.new("UIListLayout", row)
+        rl.FillDirection = Enum.FillDirection.Horizontal; rl.Padding = UDim.new(0,6)
+        local function logBtn(txt, cb)
+            local b = Instance.new("TextButton", row)
+            b.Size = UDim2.fromOffset(102,28); b.BackgroundColor3 = COL.accent
+            b.Text = txt; b.TextColor3 = COL.txt; b.Font = Enum.Font.GothamMedium; b.TextSize = 12
+            Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
+            b.MouseButton1Click:Connect(cb)
+        end
+        logBtn("Diagnostico", function()
+            task.spawn(function()
+                local ok, err = pcall(Feat.diagnose)
+                if not ok then Core.log("diag erro: " .. tostring(err)) end
+            end)
+        end)
+        logBtn("Copiar Log", function()
+            local clip = setclipboard or toclipboard
+            if type(clip) == "function" then
+                local ok = pcall(clip, table.concat(Core.logLines, "\n"))
+                Core.log(ok and "log copiado - cola no chat" or "falha ao copiar")
+            else
+                Core.log("sem clipboard nesse executor - tira print da tela")
+            end
+        end)
+    end
     local console = Instance.new("TextLabel", logpage)
     console.Size = UDim2.fromOffset(210,200); console.BackgroundColor3 = COL.panel
     console.TextColor3 = COL.txt; console.Font = Enum.Font.Code; console.TextSize = 11
@@ -1066,11 +1608,12 @@ local function buildGui()
     Core.logHook = function()
         local n = #Core.logLines
         local lines = {}
-        for i = math.max(1, n-18), n do table.insert(lines, Core.logLines[i]) end
+        for i = math.max(1, n-39), n do table.insert(lines, Core.logLines[i]) end
         console.Text = table.concat(lines, "\n")
     end
 
     main.Visible = true
+    if tabBtns.Main then tabBtns.Main.BackgroundColor3 = COL.accent end
 
     -- keybind toggle da janela
     UIS.InputBegan:Connect(function(i, gpe)
@@ -1083,6 +1626,9 @@ end
 -- 8. BOOT
 -- ============================================================
 Core.load()
+T.lift = false; T.levi = false; T.speed = false   -- barco so mexe quando VOCE ligar
+if type(CFG.BoatMethod) ~= "number" or CFG.BoatMethod < 1 or CFG.BoatMethod > 3 then CFG.BoatMethod = 1 end
+if type(CFG.SpeedMethod) ~= "number" or CFG.SpeedMethod < 1 or CFG.SpeedMethod > 2 then CFG.SpeedMethod = 1 end
 versionGuard()
 buildGui()
 Core.log("hub PRO carregado")
